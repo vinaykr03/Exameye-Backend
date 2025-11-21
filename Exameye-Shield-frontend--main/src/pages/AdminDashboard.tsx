@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Shield, Activity, Users, AlertTriangle, LogOut, Upload, RefreshCw, Download, FileText, Eye, Monitor } from "lucide-react";
+import { Shield, Activity, Users, AlertTriangle, LogOut, Upload, RefreshCw, Download, FileText, Eye, Monitor, BookOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -151,7 +151,7 @@ const AdminDashboard = () => {
             name,
             email,
             student_id,
-            face_image_url
+            roll_no
           ),
           exam_templates (
             subject_name,
@@ -168,7 +168,32 @@ const AdminDashboard = () => {
         .select('*')
         .order('timestamp', { ascending: false });
 
+      // Also fetch all students to get roll_no for students not in exam relationships
+      // Handle case where roll_no column might not exist yet
+      let studentRollNoMap = new Map<string, string>();
+      try {
+        const { data: studentsData, error: studentsError } = await supabase
+          .from('students')
+          .select('id, roll_no, name, student_id');
+        
+        if (!studentsError && studentsData) {
+          // Create a map of student_id to roll_no for quick lookup
+          studentsData.forEach((student: any) => {
+            if (student.id && student.roll_no) {
+              studentRollNoMap.set(student.id, student.roll_no);
+            }
+            if (student.student_id && student.roll_no) {
+              studentRollNoMap.set(student.student_id, student.roll_no);
+            }
+          });
+        }
+      } catch (error) {
+        console.warn('Could not fetch students roll_no (column may not exist yet):', error);
+      }
+
       setViolations(violationsData || []);
+      // Store student roll_no map for use in grouping
+      (window as any).studentRollNoMap = studentRollNoMap;
 
       // Calculate stats
       const activeCount = (examsData || []).filter(e => e.status === 'in_progress').length;
@@ -237,96 +262,127 @@ const AdminDashboard = () => {
     
     // Helper to extract student info from violation
     const getStudentInfo = (violation: any) => {
-      const studentId = violation.student_id || violation.details?.student_id || 'unknown';
+      const vDetails = violation.details as any;
+      const studentId = violation.student_id || vDetails?.student_id || 'unknown';
       // CRITICAL: Prioritize details.student_name as it's the most reliable source
-      const studentName = violation.details?.student_name || violation.student_name || 'Unknown Student';
-      const subjectCode = violation.details?.subject_code || '';
-      const examId = violation.exam_id || 'no_exam';
+      const studentName = vDetails?.student_name || (violation as any).student_name || 'Unknown Student';
+      const subjectCode = vDetails?.subject_code || '';
       
       // Debug log for violations with Unknown Student
       if (studentName === 'Unknown Student') {
         console.warn('⚠️ Unknown Student found in violation:', {
           violation_type: violation.violation_type,
           has_details: !!violation.details,
-          details_student_name: violation.details?.student_name,
-          violation_student_name: violation.student_name,
-          student_id: studentId,
-          exam_id: examId
+          details_student_name: vDetails?.student_name,
+          violation_student_name: (violation as any).student_name,
+          student_id: studentId
         });
       }
       
-      return { studentId, studentName, subjectCode, examId, normalizedName: normalizeName(studentName) };
+      return { studentId, studentName, subjectCode, normalizedName: normalizeName(studentName) };
     };
 
-    // Group violations by student name + exam_id + subject_code to keep different exam sessions separate
+    // First pass: Group violations by student name, student_id, AND exam_id/subject_code
+    // This prevents merging violations from different exam sessions
     violations.forEach(violation => {
-      const { studentId, studentName, subjectCode, examId, normalizedName } = getStudentInfo(violation);
+      const { studentId, studentName, subjectCode, normalizedName } = getStudentInfo(violation);
       
       // Skip if no valid student name
       if (normalizedName === '' || normalizedName === 'unknown student') {
         return;
       }
       
-      // CRITICAL FIX: Create a key that includes exam_id and subject_code to keep different exam sessions separate
-      // This prevents the same person from different subject codes/dates from being merged
-      const mapKey = `${normalizedName}_${examId}_${subjectCode || 'no_subject'}`;
+      // CRITICAL: Find the exam for this violation first
+      let exam = null;
+      const violationExamId = violation.exam_id || '';
+      
+      // 1. Try to find by exam_id from violation (most reliable)
+      if (violationExamId) {
+        exam = exams.find(e => e.id === violationExamId);
+      }
+      
+      // 2. Try to find by student_id (UUID match) + subject_code
+      if (!exam && studentId && studentId !== 'unknown' && studentId.length > 10) {
+        exam = exams.find(e => {
+          const examStudentId = e.students?.id || e.student_id || '';
+          const examSubjectCode = e.exam_templates?.subject_code || e.subject_code || '';
+          return (examStudentId === studentId || (e.students?.student_id && e.students.student_id === studentId)) &&
+                 (subjectCode && examSubjectCode === subjectCode);
+        });
+      }
+      
+      // 3. Try to find by student name + subject code
+      if (!exam && subjectCode) {
+        exam = exams.find(e => {
+          const examSubjectCode = e.exam_templates?.subject_code || e.subject_code || '';
+          const examStudentName = e.students?.name || '';
+          return examSubjectCode === subjectCode && 
+                 normalizeName(examStudentName) === normalizedName;
+        });
+      }
+      
+      // 4. Try to find by student_id (UUID match) only
+      if (!exam && studentId && studentId !== 'unknown' && studentId.length > 10) {
+        exam = exams.find(e => {
+          const examStudentId = e.students?.id || e.student_id || '';
+          return examStudentId === studentId || 
+                 (e.students?.student_id && e.students.student_id === studentId);
+        });
+      }
+      
+      // 5. Try to find by student name only
+      if (!exam) {
+        exam = exams.find(e => {
+          const examStudentName = e.students?.name || '';
+          return normalizeName(examStudentName) === normalizedName;
+        });
+      }
+      
+      // Get exam_id and subject_code for grouping key
+      const examIdForGrouping = exam?.id || violationExamId || null;
+      const subjectCodeForGrouping = exam?.exam_templates?.subject_code || exam?.subject_code || subjectCode || 'no_subject';
+      
+      // CRITICAL: Use timestamp to identify different exam sessions
+      // ALWAYS use date-based grouping to separate different exam days, even if exam_id exists
+      // This ensures violations from different dates are NEVER merged, even if they have the same exam_id
+      let sessionIdentifier: string;
+      if (violation.timestamp) {
+        try {
+          const violationDate = new Date(violation.timestamp);
+          const dateKey = violationDate.toISOString().split('T')[0]; // YYYY-MM-DD
+          
+          if (examIdForGrouping) {
+            // If we have exam_id, combine it with date to ensure different dates are separate
+            // Format: examId_YYYY-MM-DD
+            sessionIdentifier = `${examIdForGrouping}_${dateKey}`;
+          } else {
+            // If no exam_id, use date-based grouping to separate different exam days
+            // Format: date_YYYY-MM-DD
+            sessionIdentifier = `date_${dateKey}`;
+          }
+        } catch (e) {
+          // If date parsing fails, use exam_id only or fallback
+          sessionIdentifier = examIdForGrouping || `time_${violation.timestamp?.substring(0, 10) || 'unknown'}`;
+        }
+      } else {
+        // If no timestamp, use exam_id if available, otherwise unique identifier
+        sessionIdentifier = examIdForGrouping || `unknown_${violation.id}`;
+      }
+      
+      console.log(`🔍 Violation ${violation.id}: sessionIdentifier = ${sessionIdentifier} (exam_id: ${examIdForGrouping}, date: ${violation.timestamp ? new Date(violation.timestamp).toISOString().split('T')[0] : 'no date'})`);
+      
+      // CRITICAL: Create a key that includes exam_id (or date-based session) and subject_code to keep different exam sessions separate
+      // This ensures violations from different exam sessions are NEVER merged
+      const mapKey = `${normalizedName}_${studentId}_${sessionIdentifier}_${subjectCodeForGrouping}`;
       
       if (!studentMap[mapKey]) {
-        // Try to find exam data for this student by multiple criteria
-        let exam = null;
-        
-        // 1. First priority: Try to find by exam_id (most reliable)
-        if (examId && examId !== 'no_exam') {
-          exam = exams.find(e => e.id === examId);
-        }
-        
-        // 2. Try to find by student_id (UUID match) AND subject_code
-        if (!exam && studentId && studentId !== 'unknown' && studentId.length > 10 && subjectCode) {
-          exam = exams.find(e => {
-            const examStudentId = e.students?.id || e.student_id || '';
-            const examSubjectCode = e.exam_templates?.subject_code || e.subject_code || '';
-            return (examStudentId === studentId || 
-                   (e.students?.student_id && e.students.student_id === studentId)) &&
-                   examSubjectCode === subjectCode;
-          });
-        }
-        
-        // 3. Try to find by student name AND subject code
-        if (!exam && subjectCode) {
-          exam = exams.find(e => {
-            const examSubjectCode = e.exam_templates?.subject_code || e.subject_code || '';
-            const examStudentName = e.students?.name || '';
-            return examSubjectCode === subjectCode && 
-                   normalizeName(examStudentName) === normalizedName;
-          });
-        }
-        
-        // 4. Try to find by student_id (UUID match) only
-        if (!exam && studentId && studentId !== 'unknown' && studentId.length > 10) {
-          exam = exams.find(e => {
-            const examStudentId = e.students?.id || e.student_id || '';
-            return examStudentId === studentId || 
-                   (e.students?.student_id && e.students.student_id === studentId);
-          });
-        }
-        
-        // 5. Try to find by student name only (last resort)
-        if (!exam) {
-          exam = exams.find(e => {
-            const examStudentName = e.students?.name || '';
-            return normalizeName(examStudentName) === normalizedName;
-          });
-        }
-        
         // Determine the best student ID to use
         let bestStudentId = studentId;
         let bestId = studentId;
-        let bestExamId = examId !== 'no_exam' ? examId : null;
         
         if (exam) {
           bestStudentId = exam.students?.student_id || exam.student_id || studentId;
           bestId = exam.students?.id || exam.id || studentId;
-          bestExamId = exam.id;
         } else {
           // Try to find student in students table by name
           // Note: We don't have direct access to students table here,
@@ -336,69 +392,61 @@ const AdminDashboard = () => {
           }
         }
         
-        // Get face image from the exam session (ensures correct photo for this exam)
-        let faceImageUrl = null;
-        if (exam) {
-          faceImageUrl = exam.students?.face_image_url || null;
-        } else if (bestExamId) {
-          // Try to get face image from exam if we have examId
-          const examForImage = exams.find(e => e.id === bestExamId);
-          faceImageUrl = examForImage?.students?.face_image_url || null;
+        // Extract subject name with priority: exam template > exam > violation details
+        let finalSubjectName = 'N/A';
+        if (exam?.exam_templates?.subject_name) {
+          finalSubjectName = exam.exam_templates.subject_name;
+        } else if (exam?.subject_name) {
+          finalSubjectName = exam.subject_name;
+        } else if ((violation.details as any)?.subject_name) {
+          finalSubjectName = (violation.details as any).subject_name;
         }
         
-        // Get subject information with better fallback logic
-        let finalSubjectName = 'N/A';
-        let finalSubjectCode = 'N/A';
+        // Extract subject code with priority: exam template > exam > violation details
+        let finalSubjectCode = subjectCodeForGrouping !== 'no_subject' ? subjectCodeForGrouping : 'N/A';
+        if (exam?.exam_templates?.subject_code) {
+          finalSubjectCode = exam.exam_templates.subject_code;
+        } else if (exam?.subject_code) {
+          finalSubjectCode = exam.subject_code;
+        } else if (subjectCode && subjectCode !== 'no_subject') {
+          finalSubjectCode = subjectCode;
+        }
         
-        if (exam) {
-          // Priority 1: exam_templates (most reliable)
-          if (exam.exam_templates?.subject_name) {
-            finalSubjectName = exam.exam_templates.subject_name;
-            finalSubjectCode = exam.exam_templates.subject_code || exam.exam_templates.subject_code || exam.subject_code || subjectCode || 'N/A';
+        // Get roll_no from violation details, exam, or students map
+        const violationDetails = violation.details as any;
+        const studentRollNoMap = (window as any).studentRollNoMap as Map<string, string> | undefined;
+        
+        let rollNo = violationDetails?.roll_no || exam?.students?.roll_no;
+        
+        // If still not found, try to get from students map using student_id
+        if ((!rollNo || rollNo === 'UNKNOWN' || rollNo === 'N/A') && studentRollNoMap) {
+          if (bestStudentId && bestStudentId !== 'unknown') {
+            rollNo = studentRollNoMap.get(bestStudentId) || studentRollNoMap.get(bestId) || rollNo;
           }
-          // Priority 2: exam.subject_name (if exam_templates not loaded)
-          else if (exam.subject_name) {
-            finalSubjectName = exam.subject_name;
-            finalSubjectCode = exam.subject_code || subjectCode || 'N/A';
+          // Also try with violation student_id
+          const vStudentId = violation.student_id || violationDetails?.student_id;
+          if ((!rollNo || rollNo === 'UNKNOWN' || rollNo === 'N/A') && vStudentId) {
+            rollNo = studentRollNoMap.get(vStudentId) || rollNo;
           }
-          // Priority 3: exam.subject_code only (try to get name from violation details)
-          else if (exam.subject_code) {
-            finalSubjectCode = exam.subject_code;
-            finalSubjectName = violation.details?.subject_name || 'N/A';
-          }
-          // Priority 4: violation details
-          else if (violation.details?.subject_name) {
-            finalSubjectName = violation.details.subject_name;
-            finalSubjectCode = violation.details.subject_code || subjectCode || 'N/A';
-          }
-          // Priority 5: subjectCode from violation details
-          else if (subjectCode && subjectCode !== 'N/A' && !subjectCode.startsWith('EXAM-')) {
-            finalSubjectCode = subjectCode;
-            finalSubjectName = 'N/A';
-          }
-        } else {
-          // No exam found - try violation details
-          if (violation.details?.subject_name) {
-            finalSubjectName = violation.details.subject_name;
-            finalSubjectCode = violation.details.subject_code || subjectCode || 'N/A';
-          } else if (subjectCode && subjectCode !== 'N/A' && !subjectCode.startsWith('EXAM-')) {
-            // Only use subjectCode if it's not the old format (EXAM-XXXXX)
-            finalSubjectCode = subjectCode;
-            finalSubjectName = 'N/A';
-          }
+        }
+        
+        // Fallback to N/A if still not found
+        if (!rollNo || rollNo === 'UNKNOWN') {
+          rollNo = 'N/A';
         }
         
         studentMap[mapKey] = {
           name: exam?.students?.name || studentName,
           studentId: bestStudentId,
+          rollNo: rollNo, // Store roll_no for display
           id: bestId, // Use student UUID or exam id
-          examId: bestExamId, // Store exam id for View Report navigation
+          examId: examIdForGrouping || exam?.id || null, // Store exam id for View Report navigation
+          sessionIdentifier: sessionIdentifier, // Store session identifier for grouping (exam_id or date-based)
           violationCount: 0,
           violationTypes: [],
           violations: [],
           subjectName: finalSubjectName,
           subjectCode: finalSubjectCode,
-          faceImageUrl: faceImageUrl,
         };
       }
       
@@ -409,8 +457,60 @@ const AdminDashboard = () => {
       studentMap[mapKey].violations.push(violation);
     });
 
-    // Sort violations by timestamp (most recent first) for each student entry
+    // Second pass: Only merge students with same name AND same exam session
+    // Use sessionIdentifier (exam_id or date-based) to keep different exam sessions separate
+    const mergedMap: { [key: string]: any } = {};
     Object.values(studentMap).forEach((student: any) => {
+      const normalizedName = normalizeName(student.name);
+      // CRITICAL: Include sessionIdentifier (exam_id or date) and subject_code in the merge key
+      // This keeps different exam sessions separate even if they have the same student name
+      const sessionId = student.sessionIdentifier || student.examId || 'no_exam';
+      const mergeKey = `${normalizedName}_${sessionId}_${student.subjectCode || 'no_subject'}`;
+      
+      if (!mergedMap[mergeKey]) {
+        mergedMap[mergeKey] = { ...student };
+      } else {
+        // Only merge if they're from the same exam session (same sessionIdentifier and subject_code)
+        if (student.sessionIdentifier === mergedMap[mergeKey].sessionIdentifier && 
+            student.subjectCode === mergedMap[mergeKey].subjectCode) {
+          // Merge violations and types
+          mergedMap[mergeKey].violations = [
+            ...mergedMap[mergeKey].violations,
+            ...student.violations
+          ];
+          mergedMap[mergeKey].violationCount += student.violationCount;
+          student.violationTypes.forEach((type: string) => {
+            if (!mergedMap[mergeKey].violationTypes.includes(type)) {
+              mergedMap[mergeKey].violationTypes.push(type);
+            }
+          });
+          
+          // Prefer exam data if available (prioritize the one with examId)
+          if (student.examId && !mergedMap[mergeKey].examId) {
+            mergedMap[mergeKey].examId = student.examId;
+            mergedMap[mergeKey].id = student.id;
+            mergedMap[mergeKey].studentId = student.studentId;
+            mergedMap[mergeKey].subjectName = student.subjectName;
+            mergedMap[mergeKey].subjectCode = student.subjectCode;
+          } else if (student.subjectCode && student.subjectCode !== 'N/A' && mergedMap[mergeKey].subjectCode === 'N/A') {
+            // Update subject info if we have better data
+            mergedMap[mergeKey].subjectName = student.subjectName;
+            mergedMap[mergeKey].subjectCode = student.subjectCode;
+          } else if (student.subjectName && student.subjectName !== 'N/A' && mergedMap[mergeKey].subjectName === 'N/A') {
+            // Update subject name if we have better data
+            mergedMap[mergeKey].subjectName = student.subjectName;
+          }
+        } else {
+          // Different exam session - create separate entry
+          // Use a unique key that includes sessionIdentifier to keep them separate
+          const uniqueKey = `${mergeKey}_${student.sessionIdentifier || student.examId || Date.now()}`;
+          mergedMap[uniqueKey] = { ...student };
+        }
+      }
+    });
+
+    // Sort violations by timestamp (most recent first)
+    Object.values(mergedMap).forEach((student: any) => {
       student.violations.sort((a: any, b: any) => {
         const timeA = new Date(a.timestamp || 0).getTime();
         const timeB = new Date(b.timestamp || 0).getTime();
@@ -419,8 +519,7 @@ const AdminDashboard = () => {
     });
 
     // Filter out entries with no violations (shouldn't happen, but safety check)
-    // Keep each exam session separate - DO NOT merge by name anymore
-    const validStudents = Object.values(studentMap).filter((student: any) => 
+    const validStudents = Object.values(mergedMap).filter((student: any) => 
       student.violations && student.violations.length > 0
     );
 
@@ -445,9 +544,8 @@ const AdminDashboard = () => {
         // Start with violations that are directly linked by exam_id
         const examViolations = violationsByExam[exam.id] || [];
 
-        // CRITICAL FIX: Only include violations that are strictly linked to this exam_id
-        // Do NOT merge violations from different exam sessions, even if same student name
-        // This prevents mixing photos and violations from different dates/subject codes
+        // Also include violations that match this student by name/student_id,
+        // even if exam_id is missing or incorrect (common for some detectors)
         const examStudentName = normalizeName(exam.students?.name || '');
         const examStudentId = exam.students?.student_id || exam.student_id || '';
         const examSubjectCode =
@@ -457,35 +555,22 @@ const AdminDashboard = () => {
           // Skip ones already linked via exam_id
           if (v.exam_id === exam.id) return false;
 
-          // CRITICAL: Only match violations that have the same exam_id OR
-          // have matching exam_id in details AND same subject code
-          // This ensures we don't mix violations from different exam sessions
-          const vExamId = v.exam_id || v.details?.exam_id || '';
-          const vStudentId = v.student_id || v.details?.student_id || '';
+          const vDetails = v.details as any;
+          const vStudentId = v.student_id || vDetails?.student_id || '';
           const vStudentName = normalizeName(
-            v.details?.student_name || v.student_name || ''
+            vDetails?.student_name || (v as any).student_name || ''
           );
-          const vSubjectCode = v.details?.subject_code || '';
+          const vSubjectCode = vDetails?.subject_code || '';
 
-          // Must have matching exam_id (primary requirement)
-          if (vExamId && vExamId !== exam.id) {
-            return false;
-          }
-
-          // Must match by name or student_id AND subject code
+          // Must match by name or student_id
           const matchesStudent =
             (!!examStudentName && vStudentName === examStudentName) ||
             (!!examStudentId && vStudentId === examStudentId);
 
           if (!matchesStudent) return false;
 
-          // CRITICAL: Subject codes MUST match to prevent mixing different exam sessions
+          // If both sides have subject codes, require them to match
           if (examSubjectCode && vSubjectCode && examSubjectCode !== vSubjectCode) {
-            return false;
-          }
-
-          // If no subject code in violation, only include if exam_id matches exactly
-          if (!vSubjectCode && vExamId !== exam.id) {
             return false;
           }
 
@@ -536,7 +621,7 @@ const AdminDashboard = () => {
           studentUuid: exam.students?.id || exam.student_id || exam.id,
           // Human-readable ID (roll number / college id)
           studentIdentifier:
-            exam.students?.student_id || exam.student_id || 'N/A',
+            exam.students?.roll_no || exam.students?.student_id || exam.student_id || 'N/A',
           name: exam.students?.name || 'Unknown Student',
           subjectName:
             exam.exam_templates?.subject_name || exam.subject_name || 'N/A',
@@ -562,10 +647,18 @@ const AdminDashboard = () => {
     setCompletedStudents(completed);
   };
 
-  const handleLogout = () => {
-    sessionStorage.removeItem('adminAuth');
-    toast.success("Logged out");
-    navigate('/');
+  const handleLogout = async () => {
+    try {
+      await supabase.auth.signOut({ scope: 'global' });
+    } catch (error) {
+      console.error('Error signing out:', error);
+    } finally {
+      sessionStorage.removeItem('adminAuth');
+      sessionStorage.removeItem('adminName');
+      sessionStorage.removeItem('adminOAuthPending');
+      toast.success("Logged out");
+      navigate('/admin/login');
+    }
   };
 
   const handleExportCSV = async (student: any) => {
@@ -582,18 +675,8 @@ const AdminDashboard = () => {
                                'Unknown_Student';
       const sanitizedName = actualStudentName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
       
-      // Include subject code in filename to differentiate between different exam sessions
-      const subjectCode = student.subjectCode && student.subjectCode !== 'N/A' 
-        ? `_${student.subjectCode.replace(/\s+/g, '_')}` 
-        : '';
-      
-      // Include exam date if available
-      const examDate = student.violations?.[0]?.timestamp 
-        ? `_${new Date(student.violations[0].timestamp).toISOString().split('T')[0]}`
-        : '';
-      
       a.href = url;
-      a.download = `${sanitizedName}${subjectCode}${examDate}_violations.csv`;
+      a.download = `${sanitizedName}_violations.csv`;
       a.click();
       window.URL.revokeObjectURL(url);
       toast.success("CSV exported");
@@ -613,20 +696,9 @@ const AdminDashboard = () => {
                                'Unknown Student';
      
       // Try to find a matching exam session for score + face image
-      // CRITICAL: Prioritize examId to get the correct exam session (not just any exam with same name)
       const normalizeName = (name: string) => (name || '').toLowerCase().trim();
       let exam = examSessions.find(e => e.id === student.examId);
-      if (!exam && student.subjectCode && student.subjectCode !== 'N/A') {
-        // If examId not found, try to find by student name AND subject code to get correct exam session
-        exam = examSessions.find(e => {
-          const examSubjectCode = e.exam_templates?.subject_code || e.subject_code || '';
-          const examStudentName = e.students?.name || '';
-          return examSubjectCode === student.subjectCode &&
-                 normalizeName(examStudentName) === normalizeName(student.name);
-        });
-      }
       if (!exam) {
-        // Last resort: find by student_id/name (but this might get wrong exam session)
         exam = examSessions.find(e =>
           e.student_id === student.studentId ||
           e.students?.student_id === student.studentId ||
@@ -671,7 +743,8 @@ const AdminDashboard = () => {
         student.subjectName,
         student.subjectCode,
         examScore,
-        faceImageUrl
+        faceImageUrl,
+        student.rollNo
       );
       
       window.open(pdfUrl, '_blank');
@@ -745,6 +818,10 @@ const AdminDashboard = () => {
             <Button variant="outline" size="sm" onClick={() => navigate('/admin/monitor')}>
               <Monitor className="w-4 h-4 mr-2" />
               Live Monitor
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => navigate('/admin/subjects')}>
+              <BookOpen className="w-4 h-4 mr-2" />
+              Subjects
             </Button>
             <Button variant="outline" size="sm" onClick={loadDashboardData}>
               <RefreshCw className="w-4 h-4 mr-2" />
@@ -901,8 +978,8 @@ const AdminDashboard = () => {
                     </div>
                     <div className="mt-2">
                       <p className="text-xs font-medium">
-                        {violation.details?.student_name || 
-                         violation.student_name || 
+                        {(violation.details as any)?.student_name || 
+                         (violation as any).student_name || 
                          (violation.exam_id ? examSessions.find(e => e.id === violation.exam_id)?.students?.name : null) ||
                          'Unknown Student'}
                       </p>
@@ -935,41 +1012,14 @@ const AdminDashboard = () => {
 
                 <div className="space-y-4">
                   {studentsWithViolations.map((student) => (
-                    <div key={`${student.id}_${student.examId || 'no_exam'}`} className="border rounded-lg p-4">
+                    <div key={student.id} className="border rounded-lg p-4">
                       <div className="flex items-start justify-between mb-3">
-                        <div className="flex items-start gap-3">
-                          {student.faceImageUrl && (
-                            <div className="w-12 h-12 rounded-full overflow-hidden border">
-                              <img
-                                src={student.faceImageUrl}
-                                alt={student.name}
-                                className="w-full h-full object-cover"
-                                onError={(e) => {
-                                  e.currentTarget.src = '/placeholder.svg';
-                                }}
-                              />
-                            </div>
-                          )}
-                          <div>
-                            <h3 className="font-bold">{student.name}</h3>
-                            <p className="text-sm text-muted-foreground">{student.studentId}</p>
-                            <p className="text-xs text-muted-foreground mt-1">
-                            <span className="font-medium">Subject:</span> {
-                              student.subjectName && student.subjectName !== 'N/A' 
-                                ? `${student.subjectName}${student.subjectCode && student.subjectCode !== 'N/A' && !student.subjectCode.startsWith('EXAM-') ? ` (${student.subjectCode})` : ''}`
-                                : student.subjectCode && student.subjectCode !== 'N/A' && !student.subjectCode.startsWith('EXAM-')
-                                  ? student.subjectCode
-                                  : student.subjectCode && student.subjectCode !== 'N/A'
-                                    ? `Code: ${student.subjectCode}`
-                                    : 'Not specified'
-                            }
+                        <div>
+                          <h3 className="font-bold">{student.name}</h3>
+                          <p className="text-sm text-muted-foreground">Roll No: {student.rollNo || student.studentId || 'N/A'}</p>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            <span className="font-medium">Subject:</span> {student.subjectName} ({student.subjectCode})
                           </p>
-                            {student.violations?.[0]?.timestamp && (
-                              <p className="text-xs text-muted-foreground">
-                                <span className="font-medium">Exam Date:</span> {formatDate(student.violations[0].timestamp)}
-                              </p>
-                            )}
-                          </div>
                         </div>
                         <div className="flex items-center gap-2">
                           <AlertTriangle className="w-5 h-5 text-red-600" />
@@ -1167,7 +1217,8 @@ const AdminDashboard = () => {
                                 student.subjectName,
                                 student.subjectCode,
                                 examScore,
-                                student.faceImageUrl || undefined
+                                student.faceImageUrl || undefined,
+                                student.studentIdentifier // Use roll_no if available, fallback to studentIdentifier
                               );
                               window.open(pdfUrl, "_blank");
                               toast.success("Report generated and saved to Supabase");
@@ -1209,8 +1260,9 @@ const AdminDashboard = () => {
                 <div className="space-y-3">
                   {violations.slice(0, 10).map((violation) => {
                     // Try multiple sources for student name
-                    const studentName = violation.details?.student_name || 
-                                      violation.student_name || 
+                    const vDetails = violation.details as any;
+                    const studentName = vDetails?.student_name || 
+                                      (violation as any).student_name || 
                                       (violation.exam_id ? examSessions.find(e => e.id === violation.exam_id)?.students?.name : null) ||
                                       'Unknown Student';
                     

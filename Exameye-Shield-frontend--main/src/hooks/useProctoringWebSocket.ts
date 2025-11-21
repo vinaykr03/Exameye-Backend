@@ -27,6 +27,7 @@ interface UseProctoringWebSocketOptions {
   examId: string;
   studentId: string;
   studentName: string;
+  rollNo?: string;
   subjectCode: string;
   subjectName: string;
   calibratedPitch: number;
@@ -40,6 +41,7 @@ export const useProctoringWebSocket = ({
   examId,
   studentId,
   studentName,
+  rollNo,
   subjectCode,
   subjectName,
   calibratedPitch,
@@ -191,6 +193,7 @@ export const useProctoringWebSocket = ({
         exam_id: examId,
         student_id: studentId,
         student_name: currentStudentName,
+        roll_no: rollNo, // Send roll_no for file organization
         subject_code: subjectCode,
         subject_name: subjectName,
         audio_level: audioLevel,
@@ -233,6 +236,7 @@ export const useProctoringWebSocket = ({
         exam_id: examId || undefined,
         student_id: studentId || undefined,
         student_name: finalStudentName,
+        roll_no: rollNo || undefined,
         subject_code: subjectCode || undefined,
         subject_name: subjectName || undefined,
       };
@@ -258,6 +262,7 @@ export const useProctoringWebSocket = ({
         exam_id: examId,
         student_id: studentId,
         student_name: studentName,
+        roll_no: rollNo || undefined,
         subject_code: subjectCode,
         subject_name: subjectName,
       };

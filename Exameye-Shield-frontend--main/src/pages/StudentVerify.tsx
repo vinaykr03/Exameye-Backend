@@ -6,6 +6,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
 
+const MICROPHONE_THRESHOLD = 10; // percentage (approx)
+
 const StudentVerify = () => {
   const navigate = useNavigate();
   const [studentData, setStudentData] = useState<any>(null);
@@ -79,7 +81,7 @@ const StudentVerify = () => {
           const dataArray = new Uint8Array(analyser.frequencyBinCount);
           let audioDetected = false;
           let checkCount = 0;
-          const maxChecks = 30; // Check for 3 seconds (100ms * 30)
+          const maxChecks = 40; // 4 seconds
           
           // Check for audio input
           await new Promise((resolve) => {
@@ -89,7 +91,7 @@ const StudentVerify = () => {
               
               console.log(`🎤 Microphone test (attempt ${attemptNumber}): audio level = ${average.toFixed(1)}`);
               
-              if (average > 10) { // Threshold for detecting sound
+              if (average >= MICROPHONE_THRESHOLD) {
                 audioDetected = true;
                 console.log(`✅ Audio input detected on attempt ${attemptNumber}!`);
                 resolve(null);
@@ -142,9 +144,9 @@ const StudentVerify = () => {
         setMicrophoneWorking(true);
         toast.success("Microphone is working properly!");
       } else {
-        setChecks(prev => ({ ...prev, microphone: { status: 'error', message: 'No audio detected after 2 attempts - Please speak or check microphone' } }));
+        setChecks(prev => ({ ...prev, microphone: { status: 'error', message: 'No audio detected. Please read the sentence aloud and try again.' } }));
         setMicrophoneWorking(false);
-        toast.error("Microphone test failed after 2 attempts! No audio detected. Please speak or make noise to test your microphone, then try verification again.", {
+        toast.error("Microphone test failed. Please read the sentence aloud so we can calibrate your microphone, then retry.", {
           duration: 8000
         });
       }
@@ -290,10 +292,10 @@ const StudentVerify = () => {
       await new Promise(resolve => setTimeout(resolve, 500));
       setProgress(100);
 
-      toast.success("Verification complete! Starting exam...");
+      toast.success("Verification complete! Proceeding to compatibility checks...");
       
       setTimeout(() => {
-        navigate('/student/exam');
+        navigate('/student/compatibility');
       }, 1500);
 
     } catch (error: any) {

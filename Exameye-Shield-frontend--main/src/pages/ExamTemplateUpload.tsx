@@ -34,11 +34,16 @@ const ExamTemplateUpload = () => {
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0];
-      if (selectedFile.name.endsWith('.xlsx') || selectedFile.name.endsWith('.xls')) {
+      const isExcel = selectedFile.name.endsWith('.xlsx') || selectedFile.name.endsWith('.xls');
+      const isCsv = selectedFile.name.endsWith('.csv');
+      
+      if (isExcel || isCsv) {
         setFile(selectedFile);
         // Parse and preview immediately
         try {
-          const parsedData = await parseExcelFile(selectedFile);
+          const parsedData = isCsv 
+            ? await parseCsvFile(selectedFile)
+            : await parseExcelFile(selectedFile);
           const processedQuestions = parsedData.map((q: any, index: number) => {
             const hasOptions = q.Question_No || q.Question || q.Option_A || q.Option_B;
             return {
@@ -59,10 +64,10 @@ const ExamTemplateUpload = () => {
           setShowPreview(true);
         } catch (error) {
           console.error('Error parsing file:', error);
-          toast.error("Failed to parse Excel file");
+          toast.error(`Failed to parse ${isCsv ? 'CSV' : 'Excel'} file`);
         }
       } else {
-        toast.error("Please select an Excel file (.xlsx or .xls)");
+        toast.error("Please select an Excel file (.xlsx or .xls) or CSV file (.csv)");
       }
     }
   };
@@ -89,6 +94,29 @@ const ExamTemplateUpload = () => {
     });
   };
 
+  const parseCsvFile = async (file: File): Promise<any[]> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      
+      reader.onload = (e) => {
+        try {
+          const text = e.target?.result as string;
+          // Use XLSX library to parse CSV (it supports CSV format)
+          const workbook = XLSX.read(text, { type: 'string' });
+          const sheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[sheetName];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+          resolve(jsonData);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      
+      reader.onerror = (error) => reject(error);
+      reader.readAsText(file);
+    });
+  };
+
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -98,7 +126,7 @@ const ExamTemplateUpload = () => {
     }
 
     if (!file) {
-      toast.error("Please select an Excel file");
+      toast.error("Please select an Excel or CSV file");
       return;
     }
 
@@ -126,8 +154,11 @@ const ExamTemplateUpload = () => {
     setLoading(true);
 
     try {
-      // Parse Excel file
-      const questions = await parseExcelFile(file);
+      // Parse file (Excel or CSV)
+      const isCsv = file.name.endsWith('.csv');
+      const questions = isCsv 
+        ? await parseCsvFile(file)
+        : await parseExcelFile(file);
       
       if (questions.length === 0) {
         toast.error("No questions found in the Excel file");
@@ -220,7 +251,7 @@ const ExamTemplateUpload = () => {
             <div className="text-center mb-8">
               <h2 className="text-2xl font-bold mb-2">Upload Exam Template</h2>
               <p className="text-sm text-muted-foreground">
-                Upload an Excel file with exam questions (MCQ or Short Answer)
+                Upload an Excel (.xlsx, .xls) or CSV (.csv) file with exam questions (MCQ or Short Answer)
               </p>
             </div>
 
@@ -305,12 +336,12 @@ const ExamTemplateUpload = () => {
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="file">Excel File</Label>
+                <Label htmlFor="file">Excel or CSV File</Label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="file"
                     type="file"
-                    accept=".xlsx,.xls"
+                    accept=".xlsx,.xls,.csv"
                     onChange={handleFileChange}
                     required
                   />
@@ -389,8 +420,12 @@ const ExamTemplateUpload = () => {
 
         <Card className="mt-6 bg-muted/50">
           <CardContent className="p-6">
-            <h3 className="font-semibold mb-3">Excel Format Guidelines</h3>
+            <h3 className="font-semibold mb-3">File Format Guidelines (Excel/CSV)</h3>
             <ul className="space-y-2 text-sm text-muted-foreground">
+              <li className="flex items-start gap-2">
+                <div className="w-1.5 h-1.5 rounded-full bg-primary mt-1.5"></div>
+                Supported formats: Excel (.xlsx, .xls) or CSV (.csv)
+              </li>
               <li className="flex items-start gap-2">
                 <div className="w-1.5 h-1.5 rounded-full bg-primary mt-1.5"></div>
                 Required columns: Question_No, Question, Option_A, Option_B, Option_C, Option_D
@@ -406,6 +441,10 @@ const ExamTemplateUpload = () => {
               <li className="flex items-start gap-2">
                 <div className="w-1.5 h-1.5 rounded-full bg-primary mt-1.5"></div>
                 Questions with options automatically detected as MCQ, otherwise short answer
+              </li>
+              <li className="flex items-start gap-2">
+                <div className="w-1.5 h-1.5 rounded-full bg-primary mt-1.5"></div>
+                CSV files should use comma (,) as delimiter and include header row
               </li>
             </ul>
           </CardContent>

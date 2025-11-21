@@ -17,10 +17,21 @@ interface AnalyticsData {
   totalViolations: number;
   violationsByType: { type: string; count: number }[];
   scoreDistribution: { range: string; count: number }[];
-  topViolators: { name: string; studentId: string; violations: number }[];
+  topViolators: { name: string; studentId: string; rollNo?: string; violations: number }[];
 }
 
 const COLORS = ['hsl(var(--destructive))', 'hsl(var(--warning))', 'hsl(var(--primary))', 'hsl(var(--success))', 'hsl(var(--secondary))'];
+
+const sanitizeValue = (value?: string | null) => {
+  if (!value) return undefined;
+  const trimmed = value.toString().trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (lower === 'n/a' || lower === 'na' || lower === 'unknown' || lower === 'undefined') {
+    return undefined;
+  }
+  return trimmed;
+};
 
 const ExamAnalytics = () => {
   const navigate = useNavigate();
@@ -51,40 +62,53 @@ const ExamAnalytics = () => {
     try {
       setLoading(true);
 
-      // Fetch all exams with student info
-      const { data: examsData, error: examsError } = await supabase
-        .from('exams')
-        .select(`
-          *,
-          students (
-            name,
-            student_id,
-            email
-          )
-        `);
+      const [examsResponse, violationsResponse, answersResponse, questionsResponse, studentsResponse] = await Promise.all([
+        supabase
+          .from('exams')
+          .select(`
+            *,
+            students (
+              name,
+              student_id,
+              roll_no,
+              email,
+              id
+            )
+          )`),
+        supabase.from('violations').select('*'),
+        supabase.from('exam_answers').select('*'),
+        supabase.from('exam_questions').select('*'),
+        supabase.from('students').select('id, student_id, roll_no, name'),
+      ]);
 
+      const examsData = examsResponse.data;
+      const examsError = examsResponse.error;
       if (examsError) throw examsError;
 
-      // Fetch all violations
-      const { data: violationsData, error: violationsError } = await supabase
-        .from('violations')
-        .select('*');
-
+      const violationsData = violationsResponse.data;
+      const violationsError = violationsResponse.error;
       if (violationsError) throw violationsError;
 
-      // Fetch all answers for MCQ exams
-      const { data: answersData, error: answersError } = await supabase
-        .from('exam_answers')
-        .select('*');
-
+      const answersData = answersResponse.data;
+      const answersError = answersResponse.error;
       if (answersError) throw answersError;
 
-      // Fetch all questions
-      const { data: questionsData, error: questionsError } = await supabase
-        .from('exam_questions')
-        .select('*');
-
+      const questionsData = questionsResponse.data;
+      const questionsError = questionsResponse.error;
       if (questionsError) throw questionsError;
+
+      const studentsMap = new Map<string, { roll_no?: string | null; name?: string | null; id?: string | null; student_id?: string | null }>();
+      if (!studentsResponse.error && studentsResponse.data) {
+        studentsResponse.data.forEach((student) => {
+          const entry = { roll_no: sanitizeValue(student.roll_no), name: student.name, id: student.id, student_id: student.student_id };
+          if (student.id) {
+            studentsMap.set(student.id, entry);
+          }
+          if (student.student_id) {
+            studentsMap.set(student.student_id, entry);
+          }
+        });
+      }
 
       // Calculate statistics
       const totalStudents = new Set(examsData?.map(e => e.student_id)).size;
@@ -131,30 +155,126 @@ const ExamAnalytics = () => {
         .slice(0, 5);
 
       // Top violators - improved matching by student name and student_id
-      const violatorMap = new Map<string, { name: string; studentId: string; violations: number }>();
+      const violatorMap = new Map<string, { name: string; studentId: string; rollNo?: string; violations: number }>();
       
-      violationsData?.forEach(v => {
+      // Sort violations so entries with roll numbers land first
+      const sortedViolations = (violationsData || []).slice().sort((a, b) => {
+        const rollA = (a.details as any)?.roll_no || a.roll_no;
+        const rollB = (b.details as any)?.roll_no || b.roll_no;
+        if (rollA && !rollB) return -1;
+        if (!rollA && rollB) return 1;
+        return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+      });
+
+      sortedViolations.forEach(v => {
         // Try to find student from exam
         const exam = examsData?.find(e => e.id === v.exam_id);
-        const studentName = v.details?.student_name || v.student_name || 'Unknown Student';
-        const studentId = v.student_id || v.details?.student_id || 'unknown';
+        const violationDetails = v.details as any;
+        const rawStudentName = violationDetails?.student_name || v.student_name || exam?.students?.name || studentsMap.get(exam?.student_id || '')?.name;
+        const studentName = rawStudentName || 'Unknown Student';
+        const studentId = sanitizeValue(
+          v.student_id ||
+          violationDetails?.student_id ||
+          exam?.students?.student_id ||
+          exam?.student_id
+        ) || 'unknown';
+
+        let rollNo: string | undefined =
+          sanitizeValue(violationDetails?.roll_no) ||
+          sanitizeValue((v as any).roll_no) ||
+          sanitizeValue(exam?.students?.roll_no) ||
+          (studentId ? sanitizeValue(studentsMap.get(studentId)?.roll_no) : undefined);
+
+        if (!rollNo && exam?.student_id && studentsMap.get(exam.student_id)?.roll_no) {
+          rollNo = studentsMap.get(exam.student_id)?.roll_no || undefined;
+        }
+
+        // Fallback: attempt to find roll_no by matching name across students map
+        if (!rollNo && studentName && studentsMap.size > 0) {
+          const normalizedName = studentName.toLowerCase().trim();
+          for (const [, student] of studentsMap) {
+            if (student.name && student.name.toLowerCase().trim() === normalizedName && student.roll_no) {
+              rollNo = student.roll_no;
+              break;
+            }
+          }
+        }
         
         // Create key from student name (normalized) for better grouping
         const normalizedName = studentName.toLowerCase().trim();
-        const key = `${normalizedName}_${studentId}`;
-        
-        if (!violatorMap.has(key)) {
-          violatorMap.set(key, {
+        const normalizedRoll = sanitizeValue(rollNo);
+        const normalizedStudentId = studentId && studentId !== 'unknown' ? studentId : undefined;
+
+        const candidateKeys = [
+          normalizedRoll ? `roll_${normalizedRoll}` : null,
+          normalizedStudentId ? `id_${normalizedStudentId}` : null,
+          `name_${normalizedName}`
+        ].filter(Boolean) as string[];
+
+        let keyUsed: string | null = null;
+        let existingEntry: { name: string; studentId: string; rollNo?: string; violations: number } | null = null;
+
+        for (const candidate of candidateKeys) {
+          if (violatorMap.has(candidate)) {
+            existingEntry = violatorMap.get(candidate)!;
+            keyUsed = candidate;
+            break;
+          }
+        }
+
+        if (!existingEntry) {
+          const primaryKey = candidateKeys[0];
+          if (!primaryKey) return;
+          existingEntry = {
             name: exam?.students?.name || studentName,
             studentId: exam?.students?.student_id || studentId,
+            rollNo: normalizedRoll || exam?.students?.roll_no,
             violations: 0
-          });
+          };
+          violatorMap.set(primaryKey, existingEntry);
+          keyUsed = primaryKey;
+        } else {
+          if (!existingEntry.rollNo && normalizedRoll) {
+            existingEntry.rollNo = normalizedRoll;
+          }
+          if (existingEntry.name === 'Unknown Student' && studentName) {
+            existingEntry.name = studentName;
+          }
+        }
+
+        const primaryKey = candidateKeys[0];
+        if (primaryKey && keyUsed && primaryKey !== keyUsed) {
+          violatorMap.set(primaryKey, existingEntry);
+          violatorMap.delete(keyUsed);
+          keyUsed = primaryKey;
         }
         
-        violatorMap.get(key)!.violations++;
+        existingEntry.violations++;
       });
 
-      const topViolators = Array.from(violatorMap.values())
+      const normalizeKey = (value?: string) => (value || '').toLowerCase().trim();
+      const mergedViolators = Array.from(violatorMap.values()).reduce((map, violator) => {
+        const key = violator.rollNo
+          ? `roll_${violator.rollNo}`
+          : `name_${normalizeKey(violator.name)}`;
+
+        if (!map.has(key)) {
+          map.set(key, { ...violator });
+        } else {
+          const existing = map.get(key)!;
+          existing.violations += violator.violations;
+          if (!existing.rollNo && violator.rollNo) {
+            existing.rollNo = violator.rollNo;
+          }
+          if (existing.name === 'Unknown Student' && violator.name) {
+            existing.name = violator.name;
+          }
+        }
+
+        return map;
+      }, new Map<string, { name: string; studentId: string; rollNo?: string; violations: number }>());
+
+      const topViolators = Array.from(mergedViolators.values())
         .sort((a, b) => b.violations - a.violations)
         .slice(0, 5);
 
@@ -323,7 +443,7 @@ const ExamAnalytics = () => {
                   <TableRow>
                     <TableHead className="w-16">Rank</TableHead>
                     <TableHead>Student Name</TableHead>
-                    <TableHead>Student ID</TableHead>
+                    <TableHead>Roll Number</TableHead>
                     <TableHead className="text-right">Violations</TableHead>
                     <TableHead className="text-right">Status</TableHead>
                   </TableRow>
@@ -333,7 +453,7 @@ const ExamAnalytics = () => {
                     <TableRow key={index}>
                       <TableCell className="font-bold">#{index + 1}</TableCell>
                       <TableCell className="font-medium">{violator.name}</TableCell>
-                      <TableCell className="text-muted-foreground">{violator.studentId}</TableCell>
+                      <TableCell className="text-muted-foreground">{violator.rollNo || violator.studentId || 'N/A'}</TableCell>
                       <TableCell className="text-right">
                         <Badge variant="destructive">{violator.violations}</Badge>
                       </TableCell>

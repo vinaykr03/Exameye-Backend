@@ -16,6 +16,7 @@ interface StudentReportData {
     name: string;
     email: string;
     student_id: string;
+            roll_no?: string;
     face_image_url?: string;
   };
   exam: {
@@ -153,8 +154,8 @@ const StudentReport = () => {
           
           if (data) {
             violationData = data.find(v => {
-              const vStudentId = v.student_id || v.details?.student_id || '';
-              const vStudentName = v.details?.student_name || '';
+              const vStudentId = v.student_id || (v.details as any)?.student_id || '';
+              const vStudentName = (v.details as any)?.student_name || '';
               return vStudentId === studentId || 
                      normalizeName(vStudentName) === normalizeName(studentId) ||
                      vStudentId.toString().includes(studentId) ||
@@ -188,12 +189,15 @@ const StudentReport = () => {
         
         let actualStudentName = 'Unknown Student';
         let actualStudentId = studentId || 'N/A';
+        let actualRollNo: string | undefined = undefined;
         
         if (allViolations && allViolations.length > 0) {
           const violation = allViolations[0];
-          actualStudentName = violation.details?.student_name || violation.student_name || 'Unknown Student';
-          actualStudentId = violation.student_id || violation.details?.student_id || studentId || 'N/A';
-          console.log('✅ Extracted from violations:', { actualStudentName, actualStudentId });
+          const vDetails = violation.details as any;
+          actualStudentName = vDetails?.student_name || (violation as any).student_name || 'Unknown Student';
+          actualStudentId = violation.student_id || vDetails?.student_id || studentId || 'N/A';
+          actualRollNo = vDetails?.roll_no;
+          console.log('✅ Extracted from violations:', { actualStudentName, actualStudentId, actualRollNo });
         }
         
         studentData = {
@@ -201,6 +205,7 @@ const StudentReport = () => {
           name: actualStudentName,
           email: '',
           student_id: actualStudentId,
+          roll_no: actualRollNo,
         };
       }
 
@@ -218,6 +223,7 @@ const StudentReport = () => {
               name,
               email,
               student_id,
+              roll_no,
               face_image_url
             ),
             exam_templates (
@@ -239,6 +245,7 @@ const StudentReport = () => {
             name: examData.students.name || studentData?.name || 'Unknown Student',
             email: examData.students.email || studentData?.email || '',
             student_id: examData.students.student_id || examData.students.id || studentData?.student_id || 'N/A',
+            roll_no: examData.students.roll_no || studentData?.roll_no || 'N/A',
             face_image_url: examData.students.face_image_url || studentData?.face_image_url,
           };
           console.log('✅ Updated studentData from exam:', studentData);
@@ -254,6 +261,7 @@ const StudentReport = () => {
             students (
               name,
               student_id,
+              roll_no,
               face_image_url
             ),
             exam_templates (
@@ -270,13 +278,16 @@ const StudentReport = () => {
           examData = examsData;
         } else {
           // Try by student name
+          // Wrap examsByName fetch in try/catch in case roll_no column doesn't exist yet
+          try {
           const { data: examsByName } = await supabase
             .from('exams')
             .select(`
               *,
               students (
                 name,
-                student_id
+                  student_id,
+                  roll_no
               ),
               exam_templates (
                 subject_name,
@@ -287,9 +298,14 @@ const StudentReport = () => {
             .limit(10);
           
           if (examsByName) {
-            examData = examsByName.find(e => 
+              examData = examsByName
+                .filter((e: any) => !!e.students)
+                .find((e: any) =>
               normalizeName(e.students?.name || '') === normalizeName(studentData.name)
             ) || null;
+            }
+          } catch (e) {
+            console.warn('Could not fetch exams by name with roll_no (column may not exist yet):', e);
           }
         }
       }
@@ -334,309 +350,320 @@ const StudentReport = () => {
         }
       }
 
-      // Fetch ALL violations for this student - by student_id, exam_id, or student name
+      // CRITICAL FIX: Apply same logic as AdminDashboard.buildCompletedStudents
+      // Strategy: Get violations directly linked by exam_id, then merge with violations
+      // that match by student name/ID even if exam_id is missing or incorrect
       let violationsData: any[] = [];
       
-      // CRITICAL FIX: Always filter by BOTH exam_id AND student_id when both are available
-      // This prevents getting violations from other students in the same exam
-      if (examData?.id && studentData?.id && studentData.id !== 'unknown') {
-        // Try multiple queries to catch all violations (some might have exam_id/student_id in different formats)
-        const queries = [];
+      console.log('🔍 Starting comprehensive violation fetch (AdminDashboard logic)...');
+      console.log('📋 Search parameters:', {
+        examId: examData?.id || examId,
+        studentId: studentData?.id || studentId,
+        studentName: studentData?.name,
+        studentIdFromParams: studentId
+      });
         
-        // Query 1: Exact match by exam_id and student_id
-        queries.push(
-          supabase.from('violations')
+      // STEP 1: Map violations by exam_id (same as AdminDashboard)
+      const violationsByExam: Record<string, any[]> = {};
+      if (examData?.id || examId) {
+        const targetExamId = examData?.id || examId;
+        console.log(`🔍 Query 1: Fetching violations directly linked by exam_id: ${targetExamId}`);
+        
+        const { data: examViolations, error: examError } = await supabase
+          .from('violations')
             .select('*')
-            .eq('exam_id', examData.id)
-            .eq('student_id', studentData.id)
+          .eq('exam_id', targetExamId)
             .order('timestamp', { ascending: false })
-        );
+          .limit(500);
         
-        // Query 2: Match by exam_id and student_id from details
-        queries.push(
-          supabase.from('violations')
-            .select('*')
-            .eq('exam_id', examData.id)
-            .eq('details->>student_id', studentData.id)
-            .order('timestamp', { ascending: false })
-        );
-        
-        // Query 3: Match by exam_id and student name (for cases where student_id might be missing)
-        if (studentData.name) {
-          queries.push(
-            supabase.from('violations')
+        if (examError) {
+          console.error('❌ Error fetching exam violations:', examError);
+        } else {
+          console.log(`✅ Query 1: Found ${examViolations?.length || 0} violations directly linked by exam_id`);
+          
+          if (examViolations && examViolations.length > 0) {
+            // Log all violation types found
+            const violationTypes = examViolations.map(v => v.violation_type);
+            const typeCounts = violationTypes.reduce((acc, type) => {
+              acc[type] = (acc[type] || 0) + 1;
+              return acc;
+            }, {} as Record<string, number>);
+            console.log('📊 Violation types in exam (direct links):', typeCounts);
+            
+            violationsByExam[targetExamId] = examViolations;
+          }
+        }
+      }
+      
+      // STEP 2: Get ALL violations from database to find extra ones (same as AdminDashboard)
+      console.log('🔍 Query 2: Fetching ALL violations to find extra matches...');
+      const { data: allViolations, error: allViolationsError } = await supabase
+        .from('violations')
               .select('*')
-              .eq('exam_id', examData.id)
-              .ilike('details->>student_name', `%${studentData.name}%`)
               .order('timestamp', { ascending: false })
-          );
+        .limit(1000);
+      
+      if (allViolationsError) {
+        console.error('❌ Error fetching all violations:', allViolationsError);
+      } else {
+        console.log(`✅ Query 2: Found ${allViolations?.length || 0} total violations in database`);
+      }
+      
+      // STEP 3: Apply AdminDashboard.buildCompletedStudents logic
+      // Start with violations directly linked by exam_id
+      const targetExamId = examData?.id || examId;
+      const examViolations = targetExamId ? (violationsByExam[targetExamId] || []) : [];
+      
+      // Get student identifiers from exam/student data (same as AdminDashboard)
+      const examStudentName = normalizeName(examData?.students?.name || studentData?.name || '');
+      const examStudentId = examData?.students?.student_id || examData?.student_id || studentData?.student_id || studentData?.id || studentId || '';
+      const examSubjectCode = examData?.exam_templates?.subject_code || examData?.subject_code || '';
+      
+      console.log('📋 Student identifiers for matching:', {
+        examStudentName,
+        examStudentId,
+        examSubjectCode,
+        targetExamId,
+        examStatus: examData?.status
+      });
+      
+      // If no violations found by exam_id, try to find violations by student_id directly
+      // This handles cases where exam is "not_started" but violations exist
+      if (examViolations.length === 0 && (studentData?.id || studentId)) {
+        console.log('🔍 No violations found by exam_id, trying by student_id...');
+        const studentIdsToSearch = [
+          studentData?.id,
+          studentData?.student_id,
+          studentId
+        ].filter(id => id && id !== 'unknown' && id !== 'N/A');
+        
+        for (const sid of studentIdsToSearch) {
+          if (!sid) continue;
+          
+          const { data: studentViolations } = await supabase
+          .from('violations')
+          .select('*')
+            .or(`student_id.eq.${sid},details->>student_id.eq.${sid}`)
+            .order('timestamp', { ascending: false })
+            .limit(200);
+          
+          if (studentViolations && studentViolations.length > 0) {
+            console.log(`✅ Found ${studentViolations.length} violations by student_id ${sid}`);
+            // Filter to only include violations that match the exam_id if provided, or match subject code
+            const filtered = studentViolations.filter(v => {
+              // If we have target exam_id, prefer violations with that exam_id
+              if (targetExamId && v.exam_id === targetExamId) return true;
+              // If no target exam_id or violation has no exam_id, include if subject code matches
+              if (!targetExamId || !v.exam_id) {
+                const vSubjectCode = String((v.details as any)?.subject_code || '').trim();
+                return !examSubjectCode || !vSubjectCode || vSubjectCode === examSubjectCode;
+              }
+              return false;
+          });
+            
+            if (filtered.length > 0) {
+              violationsByExam[targetExamId || 'student_match'] = filtered;
+              console.log(`✅ Using ${filtered.length} violations matched by student_id`);
+            }
+            break; // Use first successful match
+          }
+        }
+      }
+      
+      // Update examViolations after potential student_id lookup
+      const finalExamViolations = targetExamId ? (violationsByExam[targetExamId] || []) : (violationsByExam['student_match'] || []);
+      
+      // Find extra violations that match by student name/student_id
+      // Priority: If exam_id matches, use it. Otherwise, match by student + subject code + date proximity
+      const extraViolations = (allViolations || []).filter((v) => {
+        // Skip ones already linked via exam_id
+        if (targetExamId && v.exam_id === targetExamId) return false;
+        
+        // Extract violation student info
+        const vStudentId = String(v.student_id || (v.details as any)?.student_id || '').trim();
+        const vStudentName = normalizeName(
+          String((v.details as any)?.student_name || (v as any).student_name || '').trim()
+        );
+        const vSubjectCode = String((v.details as any)?.subject_code || '').trim();
+        const vExamId = v.exam_id || '';
+        
+        // Must match by name OR student_id
+        const matchesStudent =
+          (!!examStudentName && vStudentName && vStudentName === examStudentName) ||
+          (!!examStudentId && vStudentId && vStudentId === examStudentId);
+        
+        if (!matchesStudent) {
+          return false;
         }
         
-        // Execute all queries and merge results
-        const results = await Promise.all(queries);
-        const violationMap = new Map();
+        // CRITICAL: If we have a target exam_id, prefer violations with that exact exam_id
+        // But if violation has a different exam_id, only exclude if subject codes don't match
+        if (targetExamId) {
+          if (vExamId && vExamId !== targetExamId) {
+            // Different exam_id - only include if subject codes match (might be same subject, different session)
+            // But we want to show violations from the specific exam session, so exclude different exam_ids
+            console.log(`⚠️ Excluding violation ${v.id}: different exam_id (violation: ${vExamId}, target: ${targetExamId})`);
+            return false;
+        }
+      }
+      
+        // If both sides have subject codes, require them to match
+        if (examSubjectCode && vSubjectCode && examSubjectCode !== vSubjectCode) {
+          return false;
+        }
         
-        results.forEach(result => {
-          if (result.data) {
-            result.data.forEach(v => {
-              // Only add if it matches our student
-              const vStudentId = v.student_id || v.details?.student_id || '';
-              const vStudentName = v.details?.student_name || v.student_name || '';
-              const matchesStudent = vStudentId === studentData.id || 
-                                   vStudentId === studentData.student_id ||
-                                   normalizeName(vStudentName) === normalizeName(studentData.name);
-              
-              if (matchesStudent && !violationMap.has(v.id)) {
+        // CRITICAL: If exam has started_at, only include violations within the exam timeframe
+        // AND from the same date (YYYY-MM-DD) to prevent merging different exam sessions
+        if (examData?.started_at && v.timestamp) {
+          try {
+            const examStartTime = new Date(examData.started_at).getTime();
+            const violationTime = new Date(v.timestamp).getTime();
+            const examEndTime = examData.completed_at 
+              ? new Date(examData.completed_at).getTime() 
+              : examStartTime + (examData.duration_minutes || 120) * 60 * 1000; // Default 2 hours if no completion time
+            
+            // Check if violation is within exam timeframe
+            const buffer = 15 * 60 * 1000; // 15 minutes in milliseconds
+            const withinTimeframe = violationTime >= examStartTime - buffer && violationTime <= examEndTime + buffer;
+            
+            // Also check if violation is from the same date as exam
+            const examDate = new Date(examData.started_at).toISOString().split('T')[0];
+            const violationDate = new Date(v.timestamp).toISOString().split('T')[0];
+            const sameDate = examDate === violationDate;
+            
+            if (!withinTimeframe || !sameDate) {
+              console.log(`⚠️ Excluding violation ${v.id}: ${!withinTimeframe ? 'outside timeframe' : ''} ${!sameDate ? 'different date' : ''} (violation: ${v.timestamp}, exam: ${examData.started_at})`);
+              return false;
+            }
+          } catch (e) {
+            console.warn(`⚠️ Failed to parse dates for violation ${v.id}:`, e);
+            return false;
+          }
+        } else if (!examData?.started_at && v.timestamp && targetExamId) {
+          // If no exam start time but we have exam_id, exclude violations with different exam_id
+          // This prevents merging violations from different exam sessions
+          if (vExamId && vExamId !== targetExamId) {
+            return false;
+          }
+        }
+        // If no exam start time and no exam_id, still include violations if they match by student and subject_code
+        // This handles cases where exam is "not_started" but violations exist
+        
+        return true;
+      });
+      
+      console.log(`✅ Found ${extraViolations.length} extra violations matching by student name/ID`);
+      if (extraViolations.length > 0) {
+        const extraTypes = extraViolations.map(v => v.violation_type);
+        const extraTypeCounts = extraTypes.reduce((acc, type) => {
+          acc[type] = (acc[type] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>);
+        console.log('📊 Extra violation types:', extraTypeCounts);
+      }
+      
+      // Merge violations (same as AdminDashboard - line 456)
+      // Use finalExamViolations if available, otherwise use examViolations
+      const violationsToMerge = finalExamViolations.length > 0 ? finalExamViolations : examViolations;
+      const mergedViolations = [...violationsToMerge, ...extraViolations];
+      
+      // Remove duplicates by violation id
+      const violationMap = new Map<string, any>();
+      mergedViolations.forEach(v => {
+              if (!violationMap.has(v.id)) {
                 violationMap.set(v.id, v);
               }
             });
-          }
-        });
-        
-        violationsData = Array.from(violationMap.values());
-        console.log(`✅ Found ${violationsData.length} violations for exam ${examData.id} and student ${studentData.id}`);
-      } else if (examData?.id) {
-        // Fallback: if no student_id, still filter by exam_id but be careful
-        const { data: examViolations } = await supabase
-          .from('violations')
-          .select('*')
-          .eq('exam_id', examData.id)
-          .order('timestamp', { ascending: false });
-        if (examViolations) {
-          // Filter by student name to ensure we only get this student's violations
-          const filtered = examViolations.filter(v => {
-            const vStudentName = v.details?.student_name || v.student_name || '';
-            return normalizeName(vStudentName) === normalizeName(studentData?.name || '');
-          });
-          violationsData = filtered;
-          console.log(`✅ Found ${filtered.length} violations for exam ${examData.id} matching student name ${studentData?.name}`);
-        }
-      }
       
-      // CRITICAL FIX: DO NOT fetch violations by student_id/name without exam_id filter
-      // This was causing violations from different exam sessions to be mixed together
-      // Only include violations that are strictly linked to this exam_id
-      // If exam_id is not available, we should not show violations from other exam sessions
+      // CRITICAL: Group violations by date to ensure different dates are kept separate
+      // If exam has started_at, only include violations from the same date (YYYY-MM-DD)
+      let finalViolations = Array.from(violationMap.values());
       
-      // Only add violations without exam_id if they match this specific exam's student AND timestamp range
-      if (examData?.id && examData.started_at && violationsData.length === 0) {
-        // Last resort: try to find violations that match this exam's time window and student
-        // but only if they don't have an exam_id set (legacy data)
-        const examStartTime = new Date(examData.started_at).getTime();
-        const examEndTime = examData.completed_at 
-          ? new Date(examData.completed_at).getTime() 
-          : Date.now();
-        
-        const { data: timeWindowViolations } = await supabase
-          .from('violations')
-          .select('*')
-          .is('exam_id', null) // Only violations without exam_id
-          .eq('student_id', studentData.id)
-          .gte('timestamp', new Date(examStartTime).toISOString())
-          .lte('timestamp', new Date(examEndTime).toISOString())
-          .order('timestamp', { ascending: false });
-        
-        if (timeWindowViolations && timeWindowViolations.length > 0) {
-          // Filter by student name as additional check
-          const filtered = timeWindowViolations.filter(v => {
-            const vStudentName = v.details?.student_name || v.student_name || '';
-            return normalizeName(vStudentName) === normalizeName(studentData?.name || '');
-          });
-          violationsData = filtered;
-          console.log(`⚠️ Found ${filtered.length} legacy violations (no exam_id) in time window for exam ${examData.id}`);
-        }
-      }
-      
-      // CRITICAL FIX: Only use violations that are strictly linked to this exam_id
-      // DO NOT merge violations from different exam sessions
-      // This ensures violations from different dates (e.g., 20/11/2025 and 17/11/2025) are kept separate
-      
-      // CRITICAL FIX: If no violations found by exam_id, try matching by subject_code
-      // This handles cases where violations don't have exam_id set or exam_id doesn't match
-      // But we still want to show violations for the same subject code and student
-      if (violationsData.length === 0 && examData?.id) {
-        const examSubjectCode = examData.exam_templates?.subject_code || examData.subject_code || '';
-        
-        if (examSubjectCode) {
-          console.log(`⚠️ No violations found by exam_id, trying to match by subject_code: ${examSubjectCode}`);
+      if (examData?.started_at) {
+        try {
+          const examDate = new Date(examData.started_at);
+          const examDateKey = examDate.toISOString().split('T')[0]; // YYYY-MM-DD
           
-          // Try to find violations by subject_code and student
-          // First try exact match
-          let subjectViolations = null;
-          const { data: exactMatch } = await supabase
-            .from('violations')
-            .select('*')
-            .eq('student_id', studentData.id)
-            .order('timestamp', { ascending: false });
+          console.log(`📅 Filtering violations by exam date: ${examDateKey}`);
           
-          if (exactMatch) {
-            // Filter in JavaScript to match subject_code from JSONB details
-            subjectViolations = exactMatch.filter(v => {
-              const vSubjectCode = v.details?.subject_code || '';
-              return vSubjectCode === examSubjectCode || 
-                     vSubjectCode.toUpperCase() === examSubjectCode.toUpperCase();
-            });
-          }
-          
-          if (subjectViolations && subjectViolations.length > 0) {
-            // Filter to ensure they match the student and subject code
-            const filtered = subjectViolations.filter(v => {
-              const vStudentId = v.student_id || v.details?.student_id || '';
-              const vStudentName = v.details?.student_name || v.student_name || '';
-              const vSubjectCode = v.details?.subject_code || '';
-              
-              const matchesStudent = vStudentId === studentData.id || 
-                                   vStudentId === studentData.student_id ||
-                                   normalizeName(vStudentName) === normalizeName(studentData.name);
-              
-              const matchesSubject = vSubjectCode === examSubjectCode || 
-                                   vSubjectCode.toUpperCase() === examSubjectCode.toUpperCase();
-              
-              return matchesStudent && matchesSubject;
-            });
+          finalViolations = finalViolations.filter(v => {
+            if (!v.timestamp) return false;
             
-            if (filtered.length > 0) {
-              violationsData = filtered;
-              console.log(`✅ Found ${filtered.length} violations by subject_code ${examSubjectCode} for student ${studentData.name}`);
+            try {
+              const violationDate = new Date(v.timestamp);
+              const violationDateKey = violationDate.toISOString().split('T')[0]; // YYYY-MM-DD
+              
+              // Only include violations from the same date as the exam
+              if (violationDateKey !== examDateKey) {
+                console.log(`⚠️ Excluding violation ${v.id}: different date (violation: ${violationDateKey}, exam: ${examDateKey})`);
+                return false;
+              }
+              
+              return true;
+            } catch (e) {
+              console.warn(`⚠️ Failed to parse violation date for ${v.id}:`, e);
+              return false;
+            }
+          });
+          
+          console.log(`✅ After date filtering: ${finalViolations.length} violations from exam date ${examDateKey}`);
+        } catch (e) {
+          console.warn(`⚠️ Failed to parse exam date:`, e);
+        }
+      } else if (targetExamId) {
+        // If no exam start time but we have exam_id, group violations by date
+        // Find the most common date among violations and only keep those
+        const dateGroups: Record<string, any[]> = {};
+        finalViolations.forEach(v => {
+          if (v.timestamp) {
+            try {
+              const violationDate = new Date(v.timestamp);
+              const dateKey = violationDate.toISOString().split('T')[0];
+              if (!dateGroups[dateKey]) dateGroups[dateKey] = [];
+              dateGroups[dateKey].push(v);
+            } catch (e) {
+              // Skip violations with invalid dates
             }
           }
-        }
-      }
-      
-      // Filter violations to ensure they all belong to this exam session OR match subject_code
-      if (examData?.id && violationsData.length > 0) {
-        const examSubjectCode = examData.exam_templates?.subject_code || examData.subject_code || '';
+        });
         
-        violationsData = violationsData.filter(v => {
-          const vExamId = v.exam_id || v.details?.exam_id || '';
-          const vSubjectCode = v.details?.subject_code || '';
-          
-          // Include if:
-          // 1. exam_id matches (primary)
-          // 2. OR subject_code matches AND student matches (fallback for legacy data or mismatched exam_id)
-          const examIdMatches = vExamId === examData.id;
-          const subjectCodeMatches = examSubjectCode && vSubjectCode && 
-                                   (vSubjectCode === examSubjectCode || 
-                                    vSubjectCode.toUpperCase() === examSubjectCode.toUpperCase());
-          
-          // If exam_id is empty or doesn't match, use subject_code as fallback
-          if (examIdMatches) {
-            return true; // Primary match by exam_id
-          } else if (subjectCodeMatches) {
-            // Fallback: match by subject_code only if exam_id is empty or doesn't match
-            // This ensures we show violations for the same subject even if exam_id is wrong
-            return true;
+        // Find the date with the most violations (likely the exam date)
+        let maxDate = '';
+        let maxCount = 0;
+        Object.entries(dateGroups).forEach(([date, violations]) => {
+          if (violations.length > maxCount) {
+            maxCount = violations.length;
+            maxDate = date;
           }
-          
-          return false;
         });
         
-        // If we filtered out all violations, log a warning
-        if (violationsData.length === 0) {
-          console.warn(`⚠️ No violations found for exam ${examData.id} after filtering`);
+        // Only keep violations from the most common date
+        if (maxDate) {
+          console.log(`📅 Grouping violations by date: using ${maxDate} (${maxCount} violations)`);
+          finalViolations = dateGroups[maxDate];
         }
       }
       
-      // Final check: Ensure all violations are from the same exam session
-      // Group by exam_id to detect any mixing
-      const violationsByExam = new Map();
-      violationsData.forEach(v => {
-        const vExamId = v.exam_id || v.details?.exam_id || 'no_exam';
-        if (!violationsByExam.has(vExamId)) {
-          violationsByExam.set(vExamId, []);
-        }
-        violationsByExam.get(vExamId).push(v);
-      });
-      
-      // If we have violations from multiple exam sessions, only keep the ones from the current exam
-      if (violationsByExam.size > 1 && examData?.id) {
-        console.warn(`⚠️ Found violations from ${violationsByExam.size} different exam sessions. Filtering to only show exam ${examData.id}`);
-        violationsData = violationsData.filter(v => {
-          const vExamId = v.exam_id || v.details?.exam_id || '';
-          return vExamId === examData.id;
-        });
-      }
-      
-      // Sort by timestamp (most recent first)
-      violationsData.sort((a, b) => {
+      violationsData = finalViolations.sort((a, b) => {
         const timeA = new Date(a.timestamp || 0).getTime();
         const timeB = new Date(b.timestamp || 0).getTime();
         return timeB - timeA;
       });
       
-      // CRITICAL: Only add violations that match the current exam_id
-      // DO NOT fetch violations without exam_id filter - this causes mixing from different dates
-      
-      // If we still don't have violations and have an exam_id, try one more time with just exam_id
-      if (violationsData.length === 0 && examData?.id) {
-        const { data: finalViolations } = await supabase
-          .from('violations')
-          .select('*')
-          .eq('exam_id', examData.id)
-          .order('timestamp', { ascending: false });
-        
-        if (finalViolations && finalViolations.length > 0) {
-          // Filter by student name to ensure we only get this student's violations
-          const filtered = finalViolations.filter(v => {
-            const vStudentName = v.details?.student_name || v.student_name || '';
-            const vStudentId = v.student_id || v.details?.student_id || '';
-            return normalizeName(vStudentName) === normalizeName(studentData?.name || '') ||
-                   vStudentId === studentData.id ||
-                   vStudentId === studentData.student_id;
-          });
-          violationsData = filtered;
-          console.log(`✅ Found ${filtered.length} violations for exam ${examData.id} using final fallback`);
-        }
-      }
-      
-      // REMOVED: All code that fetched violations without exam_id filter
-      // This was causing violations from different exam sessions (different dates) to be mixed
-      // Now we ONLY show violations for the specific exam session being viewed
-      
-      // Final validation: Ensure all violations belong to the current exam OR match subject_code
-      if (examData?.id) {
-        const examSubjectCode = examData.exam_templates?.subject_code || examData.subject_code || '';
-        
-        violationsData = violationsData.filter(v => {
-          const vExamId = v.exam_id || v.details?.exam_id || '';
-          const vSubjectCode = v.details?.subject_code || '';
-          
-          // Allow if:
-          // 1. exam_id matches (primary)
-          // 2. OR exam_id is empty and subject_code matches (fallback for legacy data)
-          const examIdMatches = vExamId === examData.id;
-          const subjectCodeMatches = examSubjectCode && vSubjectCode && 
-                                   (vSubjectCode === examSubjectCode || 
-                                    vSubjectCode.toUpperCase() === examSubjectCode.toUpperCase());
-          
-          return examIdMatches || (vExamId === '' && subjectCodeMatches);
-        });
-      }
-      
-      // Remove duplicates
-      const uniqueViolations = new Map();
-      violationsData.forEach(v => {
-        if (!uniqueViolations.has(v.id)) {
-          uniqueViolations.set(v.id, v);
-        }
+      // Comprehensive logging
+      console.log(`✅ Total violations found after merge: ${violationsData.length}`);
+      const violationTypes = violationsData.map(v => v.violation_type);
+      const typeCounts = violationTypes.reduce((acc, type) => {
+        acc[type] = (acc[type] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      console.log('📊 Final violation types:', typeCounts);
+      console.log('📊 Violations with images:', violationsData.filter(v => v.image_url).length);
+      console.log('📋 Breakdown:', {
+        directlyLinked: examViolations.length,
+        extraMatched: extraViolations.length,
+        totalAfterMerge: violationsData.length
       });
-      violationsData = Array.from(uniqueViolations.values());
-      
-      // Sort by timestamp (most recent first)
-      violationsData.sort((a, b) => {
-        const timeA = new Date(a.timestamp || 0).getTime();
-        const timeB = new Date(b.timestamp || 0).getTime();
-        return timeB - timeA;
-      });
-      
-      console.log(`✅ Final violations count for exam ${examData?.id}: ${violationsData.length}`);
-      
-      // All violations should now be filtered to only include the current exam session
-      // No more merging violations from different exam sessions/dates
-      
-      console.log(`✅ Final violations count for exam ${examData?.id}: ${violationsData.length}`);
-      console.log(`📊 Violation types found:`, violationsData.map(v => v.violation_type));
-      console.log(`📊 Violations with images:`, violationsData.filter(v => v.image_url).length);
 
       // CRITICAL FIX: Ensure we're using the correct student data
       // Priority: exam.students > studentData from lookup > filtered violations
@@ -645,12 +672,14 @@ const StudentReport = () => {
         name: examData.students.name || studentData.name,
         email: examData.students.email || studentData.email || '',
         student_id: examData.students.student_id || examData.students.id || studentData.student_id || 'N/A',
+        roll_no: examData.students.roll_no || studentData.roll_no, // propagate roll number from exam or studentData
         face_image_url: examData.students.face_image_url || studentData?.face_image_url,
       } : {
         id: studentData.id,
         name: studentData.name,
         email: studentData.email || '',
         student_id: studentData.student_id || studentData.id || 'N/A',
+        roll_no: studentData.roll_no, // keep roll number if already loaded
         face_image_url: studentData?.face_image_url,
       };
       
@@ -678,7 +707,8 @@ const StudentReport = () => {
         name: finalStudentName, 
         id: finalStudentData.id, 
         student_id: finalStudentData.student_id,
-        email: finalStudentData.email 
+        roll_no: finalStudentData.roll_no,
+        email: finalStudentData.email,
       });
       
       setReportData({
@@ -687,15 +717,16 @@ const StudentReport = () => {
           name: finalStudentName,
           email: finalStudentData.email || '',
           student_id: finalStudentData.student_id || finalStudentData.id || 'N/A',
+          roll_no: finalStudentData.roll_no,
           face_image_url: finalStudentData.face_image_url,
         },
         exam: examData ? {
           id: examData.id,
-          subject_code: examData.subject_code || examData.exam_templates?.subject_code || 'N/A',
+          subject_code: examData.exam_templates?.subject_code || examData.subject_code || (violationsData[0]?.details as any)?.subject_code || 'N/A',
           started_at: examData.started_at || '',
           completed_at: examData.completed_at || '',
           status: examData.status || 'unknown',
-          subject_name: examData.exam_templates?.subject_name || examData.subject_name || 'N/A',
+          subject_name: examData.exam_templates?.subject_name || examData.subject_name || (violationsData[0]?.details as any)?.subject_name || (violationsData[0]?.details as any)?.subject_code || 'N/A',
           duration_minutes: examData.exam_templates?.duration_minutes || 0,
         } : {
           id: '',
@@ -863,7 +894,8 @@ const StudentReport = () => {
         reportData.exam.subject_name,
         reportData.exam.subject_code,
         examScore,
-        reportData.student.face_image_url
+        reportData.student.face_image_url,
+        reportData.student.roll_no
       );
       
       window.open(pdfUrl, '_blank');
@@ -884,8 +916,8 @@ const StudentReport = () => {
       const a = document.createElement('a');
       
       // Use actual student name from violations if available
-      const actualStudentName = reportData.violations?.[0]?.details?.student_name || 
-                               reportData.violations?.[0]?.student_name || 
+      const actualStudentName = (reportData.violations?.[0]?.details as any)?.student_name || 
+                               (reportData.violations?.[0] as any)?.student_name || 
                                reportData.student.name || 
                                'Unknown_Student';
       const sanitizedName = actualStudentName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -1046,8 +1078,10 @@ const StudentReport = () => {
                 <p className="font-medium">{reportData.student.name}</p>
               </div>
               <div>
-                <p className="text-sm text-muted-foreground">Student ID</p>
-                <p className="font-medium">{reportData.student.student_id}</p>
+                <p className="text-sm text-muted-foreground">Roll Number</p>
+                <p className="font-medium">
+                  {reportData.student.roll_no || reportData.student.student_id || "N/A"}
+                </p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">Email</p>

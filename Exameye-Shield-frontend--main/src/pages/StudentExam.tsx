@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Shield, Clock, AlertTriangle, LogOut, Wifi, WifiOff } from "lucide-react";
+import { Shield, Clock, AlertTriangle, LogOut, Wifi, WifiOff, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
@@ -12,6 +12,9 @@ import { useProctoringWebSocket } from "@/hooks/useProctoringWebSocket";
 import { AudioMonitor } from "@/components/AudioMonitor";
 import { BrowserActivityMonitor } from "@/components/BrowserActivityMonitor";
 
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 15000;
+
 const StudentExam = () => {
   const navigate = useNavigate();
   const [studentData, setStudentData] = useState<any>(null);
@@ -21,6 +24,7 @@ const StudentExam = () => {
   const [violationCount, setViolationCount] = useState(0);
   const [recentWarnings, setRecentWarnings] = useState<string[]>([]);
   const [questions, setQuestions] = useState<any[]>([]);
+  const [questionsLoading, setQuestionsLoading] = useState(true);
   const [calibratedPitch, setCalibratedPitch] = useState(0);
   const [calibratedYaw, setCalibratedYaw] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
@@ -37,6 +41,12 @@ const StudentExam = () => {
   const lastAudioSendTime = useRef<number>(0);
   const audioSilenceStartTime = useRef<number | null>(null);
   const audioSilenceAlertShown = useRef<boolean>(false);
+  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const examSessionTokenRef = useRef<string | null>(null);
+  const fullscreenTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const compatibilityInfoRef = useRef<any>(null);
+  const initializationStartedRef = useRef<boolean>(false);
+  const handleSubmitRef = useRef<typeof handleSubmit | null>(null);
 
   const AUDIO_SEND_THROTTLE_MS = 1000; // Send audio level to backend max once per second when threshold exceeded
   const AUDIO_SILENCE_THRESHOLD = 5; // Threshold for detecting silence (very low audio level)
@@ -44,7 +54,8 @@ const StudentExam = () => {
   const disconnectWebSocketRef = useRef<(() => void) | null>(null);
 
   // Comprehensive cleanup function to stop all media streams and resources
-  const stopAllMediaStreams = () => {
+  // Memoized with useCallback to prevent recreation on every render
+  const stopAllMediaStreams = useCallback(() => {
     console.log('🛑 Stopping all media streams and cleaning up resources...');
     
     // Stop all media tracks (video and audio)
@@ -90,7 +101,92 @@ const StudentExam = () => {
     }
     
     console.log('✅ All media streams and resources stopped');
-  };
+  }, []); // No dependencies - only uses refs which are stable
+
+  const releaseExamSession = useCallback(async () => {
+    if (!examId || !studentData || !examSessionTokenRef.current) return;
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+    await supabase
+      .from('exam_active_sessions')
+      .update({
+        is_active: false,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('exam_id', examId)
+      .eq('student_id', studentData.id)
+      .eq('session_token', examSessionTokenRef.current);
+  }, [examId, studentData]);
+
+  const claimExamSession = useCallback(
+    async (newExamId: string, studentId: string) => {
+      if (!examSessionTokenRef.current) return false;
+      const token = examSessionTokenRef.current;
+
+      const { data: existing } = await supabase
+        .from('exam_active_sessions')
+        .select('session_token,last_heartbeat,is_active')
+        .eq('exam_id', newExamId)
+        .eq('student_id', studentId)
+        .maybeSingle();
+
+      if (
+        existing &&
+        existing.session_token !== token &&
+        existing.is_active &&
+        existing.last_heartbeat
+      ) {
+        const last = new Date(existing.last_heartbeat).getTime();
+        if (Date.now() - last < HEARTBEAT_TIMEOUT_MS) {
+          return false;
+        }
+      }
+
+      await supabase
+        .from('exam_active_sessions')
+        .upsert(
+          {
+            exam_id: newExamId,
+            student_id: studentId,
+            session_token: token,
+            last_heartbeat: new Date().toISOString(),
+            is_active: true,
+          },
+          { onConflict: 'exam_id,student_id' }
+        );
+
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+      }
+
+      heartbeatIntervalRef.current = setInterval(() => {
+        supabase
+          .from('exam_active_sessions')
+          .update({
+            last_heartbeat: new Date().toISOString(),
+            is_active: true,
+          })
+          .eq('exam_id', newExamId)
+          .eq('student_id', studentId)
+          .eq('session_token', token);
+      }, HEARTBEAT_INTERVAL_MS);
+
+      return true;
+    },
+    []
+  );
+
+  const requestFullscreenGuard = useCallback(() => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(() => {
+        toast.warning("Fullscreen permission is required. Please enable fullscreen mode.", {
+          duration: 5000,
+        });
+      });
+    }
+  }, []);
 
   // WebSocket connection for Python backend
   const { isConnected: wsConnected, sendFrame, sendAudioLevel, sendBrowserActivity, disconnect: disconnectWebSocket } = useProctoringWebSocket({
@@ -98,6 +194,7 @@ const StudentExam = () => {
     examId: examId || '',
     studentId: studentData?.id || '',
     studentName: studentNameRef.current,
+    rollNo: studentData?.rollNo || '',
     subjectCode: studentData?.subjectCode || '',
     subjectName: studentData?.subjectName || studentData?.subjectCode || '',
     calibratedPitch,
@@ -160,11 +257,129 @@ const StudentExam = () => {
     disconnectWebSocketRef.current = disconnectWebSocket;
   }, [disconnectWebSocket]);
 
+  const handleSubmit = useCallback(async () => {
+    if (!examId || !studentData) return;
+
+    try {
+      toast.info("Submitting and grading your exam...");
+      
+      // 1. Save all answers
+      const promises = Object.entries(answers).map(([questionNum, answer]) =>
+        supabase
+          .from('exam_answers')
+          .upsert({
+            exam_id: examId,
+            student_id: studentData.id,
+            question_number: parseInt(questionNum),
+            answer: answer,
+            updated_at: new Date().toISOString()
+          })
+      );
+
+      await Promise.all(promises);
+
+      // 2. Mark exam as completed
+      await supabase
+        .from('exams')
+        .update({ 
+          status: 'completed',
+          completed_at: new Date().toISOString()
+        })
+        .eq('id', examId);
+
+      await releaseExamSession();
+
+      // 3. Auto-grade the exam
+      const backendUrl = import.meta.env.VITE_PROCTORING_API_URL || 'http://localhost:8001';
+      const gradeResponse = await fetch(`${backendUrl}/api/grade-exam`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exam_id: examId,
+          student_id: studentData.id,
+          answers: Object.entries(answers).map(([questionNum, answer]) => ({
+            question_number: parseInt(questionNum),
+            answer: answer
+          }))
+        })
+      });
+
+      const gradeData = await gradeResponse.json();
+      
+      if (gradeData.success) {
+        // Show results immediately
+        toast.success(`Exam submitted and graded!`, {
+          description: `Score: ${gradeData.total_score}/${gradeData.max_score} (${gradeData.percentage}%) - Grade: ${gradeData.grade_letter}`,
+          duration: 10000
+        });
+        
+        console.log('📊 Grading Results:', gradeData);
+      } else {
+        toast.warning("Exam submitted but grading failed. Admin will grade manually.");
+      }
+      
+      // Stop all media streams and cleanup resources BEFORE navigation
+      stopAllMediaStreams();
+      
+      // Disconnect WebSocket
+      if (disconnectWebSocket) {
+        disconnectWebSocket();
+        console.log('✅ WebSocket disconnected');
+      }
+
+      // Redirect after showing results
+      setTimeout(() => {
+        navigate('/', { replace: true });
+      }, 3000);
+    } catch (error) {
+      console.error('Error submitting:', error);
+      toast.error("Failed to submit");
+      // Still cleanup even if submission fails
+      stopAllMediaStreams();
+      if (disconnectWebSocket) {
+        disconnectWebSocket();
+      }
+      releaseExamSession();
+    }
+  }, [examId, studentData, answers, navigate, stopAllMediaStreams, disconnectWebSocket, releaseExamSession]);
+
+  // Store handleSubmit in ref so it's always current for timer
   useEffect(() => {
+    handleSubmitRef.current = handleSubmit;
+  }, [handleSubmit]);
+
+  useEffect(() => {
+    // Prevent multiple initializations
+    if (initializationStartedRef.current) {
+      return;
+    }
+    initializationStartedRef.current = true;
+
+    const compatibilityRaw = sessionStorage.getItem('compatibilityCheck');
+    const tabToken = sessionStorage.getItem('examTabToken');
+    if (!compatibilityRaw || !tabToken) {
+      toast.error("Please run the compatibility check before starting the exam.");
+      navigate('/student/compatibility');
+      initializationStartedRef.current = false; // Reset on redirect
+      return;
+    }
+    try {
+      compatibilityInfoRef.current = JSON.parse(compatibilityRaw);
+    } catch (err) {
+      console.error('Invalid compatibility payload', err);
+      toast.error("Compatibility data corrupted. Please rerun the checks.");
+      sessionStorage.removeItem('compatibilityCheck');
+      navigate('/student/compatibility');
+      initializationStartedRef.current = false; // Reset on redirect
+      return;
+    }
+    examSessionTokenRef.current = tabToken;
+
     const data = sessionStorage.getItem('studentData');
     if (!data) {
       toast.error("Please register first");
       navigate('/student/register');
+      initializationStartedRef.current = false; // Reset on redirect
       return;
     }
     const parsedData = JSON.parse(data);
@@ -173,18 +388,57 @@ const StudentExam = () => {
     studentNameRef.current = parsedData.name || 'Unknown Student';
     console.log('✅ Student name loaded and saved to ref:', studentNameRef.current);
 
-    // Start exam first to get examId, then initialize monitoring
-    startExam(parsedData).then(() => {
-      console.log('✅ Exam started, initializing monitoring...');
-      initializeMonitoring();
+    // Start exam first to get examId, then load questions and initialize monitoring
+    startExam(parsedData).then(async (startedExamId) => {
+      if (!startedExamId) {
+        toast.error("Failed to start exam. Please try again.");
+        initializationStartedRef.current = false; // Reset on failure
+        return;
+      }
+      
+      // Load exam questions after examId is set
+      await loadExamQuestions();
+      
+      // Claim exam session and initialize proctoring
+      const allowed = await claimExamSession(startedExamId, parsedData.id);
+      if (!allowed) {
+        toast.error("Exam already active in another tab. Please close other tabs.");
+        navigate('/', { replace: true });
+        initializationStartedRef.current = false; // Reset on redirect
+        return;
+      }
+      
+      console.log('✅ Exam started, examId:', startedExamId);
+      console.log('✅ Loading questions and initializing proctoring system...');
+      
+      requestFullscreenGuard();
+      
+      // Initialize proctoring monitoring (camera, microphone, WebSocket)
+      try {
+        await initializeMonitoring();
+        console.log('✅ Proctoring system initialized successfully - Camera, microphone, and WebSocket ready');
+      } catch (error) {
+        console.error('❌ Failed to initialize proctoring:', error);
+        toast.error("Failed to initialize proctoring system. Please check your camera and microphone permissions.");
+      }
+      
+      // Note: WebSocket connection will be established automatically via useProctoringWebSocket hook
+      // once examId and studentData are set (enabled: !!examId && !!studentData)
+      console.log('✅ WebSocket connection will be established automatically');
+    }).catch((error) => {
+      console.error('❌ Error starting exam:', error);
+      toast.error("Failed to start exam. Please try again.");
+      initializationStartedRef.current = false; // Reset on error
     });
-    loadExamQuestions();
 
     const timer = setInterval(() => {
       setTimeRemaining(prev => {
         if (prev <= 1) {
           clearInterval(timer);
-          handleSubmit();
+          // Use ref to get current handleSubmit
+          if (handleSubmitRef.current) {
+            handleSubmitRef.current();
+          }
           return 0;
         }
         return prev - 1;
@@ -209,6 +463,8 @@ const StudentExam = () => {
         disconnectWebSocketRef.current();
         console.log('✅ WebSocket disconnected on back button');
       }
+
+      releaseExamSession();
       
       // Auto-submit the exam
       if (examId && studentData) {
@@ -261,10 +517,63 @@ const StudentExam = () => {
         disconnectWebSocketRef.current();
         console.log('✅ WebSocket disconnected on cleanup');
       }
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+      releaseExamSession();
       // Remove back button listener
       window.removeEventListener('popstate', handleBackButton);
+      if (document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+      // Don't reset guard here - only reset on actual navigation/errors
+      // This prevents re-initialization when dependencies change
     };
-  }, [navigate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Run only once on mount - use refs for functions that need to be current
+
+  useEffect(() => {
+    const lightingScore = compatibilityInfoRef.current?.lightingScore;
+    if (typeof lightingScore === 'number') {
+      if (lightingScore < 35 || lightingScore > 90) {
+        toast.warning("Lighting conditions may be suboptimal. Please ensure your face is clearly visible.", {
+          duration: 6000,
+        });
+      }
+    }
+  }, []);
+
+  // Enforce fullscreen – auto-submit if student exits
+  useEffect(() => {
+    if (!examId) return;
+
+    const handleFullscreenChange = () => {
+      if (!document.fullscreenElement) {
+        toast.error("Fullscreen is required. Returning to fullscreen or exam will submit automatically.");
+        if (!fullscreenTimeoutRef.current) {
+          fullscreenTimeoutRef.current = setTimeout(() => {
+            toast.error("Exam submitted due to leaving fullscreen.");
+            if (handleSubmitRef.current) {
+              handleSubmitRef.current();
+            }
+          }, 5000);
+        }
+      } else if (fullscreenTimeoutRef.current) {
+        clearTimeout(fullscreenTimeoutRef.current);
+        fullscreenTimeoutRef.current = null;
+      }
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      if (fullscreenTimeoutRef.current) {
+        clearTimeout(fullscreenTimeoutRef.current);
+        fullscreenTimeoutRef.current = null;
+      }
+    };
+  }, [examId]); // handleSubmit accessed via ref, no need in deps
 
   // Separate useEffect for browser activity monitoring with proper dependencies
   useEffect(() => {
@@ -327,10 +636,20 @@ const StudentExam = () => {
 
   const initializeMonitoring = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { width: 640, height: 480 }, 
-        audio: true 
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 640, height: 480 }, 
+          audio: true 
+        });
+      } catch (firstError) {
+        console.warn('First media request failed, retrying...', firstError);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 640, height: 480 }, 
+          audio: true 
+        });
+      }
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -512,8 +831,12 @@ const StudentExam = () => {
 
   const loadExamQuestions = async () => {
     try {
+      setQuestionsLoading(true);
       const data = sessionStorage.getItem('studentData');
-      if (!data) return;
+      if (!data) {
+        setQuestionsLoading(false);
+        return;
+      }
       
       const parsedData = JSON.parse(data);
       
@@ -549,12 +872,17 @@ const StudentExam = () => {
 
       if (questionsData && questionsData.length > 0) {
         setQuestions(questionsData);
+        console.log(`✅ Loaded ${questionsData.length} exam questions`);
       } else {
         toast.error("No questions found for this exam");
+        setQuestions([]);
       }
     } catch (error) {
       console.error('Error loading questions:', error);
       toast.error("Failed to load exam questions");
+      setQuestions([]);
+    } finally {
+      setQuestionsLoading(false);
     }
   };
 
@@ -579,8 +907,10 @@ const StudentExam = () => {
         })
         .eq('id', exams.id);
 
+      return exams.id;
     } catch (error) {
       console.error('Error starting exam:', error);
+      return null;
     }
   };
 
@@ -643,96 +973,20 @@ const StudentExam = () => {
     }
   };
 
-  const handleSubmit = async () => {
-    if (!examId || !studentData) return;
-
-    try {
-      toast.info("Submitting and grading your exam...");
-      
-      // 1. Save all answers
-      const promises = Object.entries(answers).map(([questionNum, answer]) =>
-        supabase
-          .from('exam_answers')
-          .upsert({
-            exam_id: examId,
-            student_id: studentData.id,
-            question_number: parseInt(questionNum),
-            answer: answer,
-            updated_at: new Date().toISOString()
-          })
-      );
-
-      await Promise.all(promises);
-
-      // 2. Mark exam as completed
-      await supabase
-        .from('exams')
-        .update({ 
-          status: 'completed',
-          completed_at: new Date().toISOString()
-        })
-        .eq('id', examId);
-
-      // 3. Auto-grade the exam
-      const backendUrl = import.meta.env.VITE_PROCTORING_API_URL || 'http://localhost:8001';
-      const gradeResponse = await fetch(`${backendUrl}/api/grade-exam`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          exam_id: examId,
-          student_id: studentData.id,
-          answers: Object.entries(answers).map(([questionNum, answer]) => ({
-            question_number: parseInt(questionNum),
-            answer: answer
-          }))
-        })
-      });
-
-      const gradeData = await gradeResponse.json();
-      
-      if (gradeData.success) {
-        // Show results immediately
-        toast.success(`Exam submitted and graded!`, {
-          description: `Score: ${gradeData.total_score}/${gradeData.max_score} (${gradeData.percentage}%) - Grade: ${gradeData.grade_letter}`,
-          duration: 10000
-        });
-        
-        console.log('📊 Grading Results:', gradeData);
-      } else {
-        toast.warning("Exam submitted but grading failed. Admin will grade manually.");
-      }
-      
-      // Stop all media streams and cleanup resources BEFORE navigation
-      stopAllMediaStreams();
-      
-      // Disconnect WebSocket
-      if (disconnectWebSocket) {
-        disconnectWebSocket();
-        console.log('✅ WebSocket disconnected');
-      }
-
-      // Redirect after showing results
-      setTimeout(() => {
-        navigate('/', { replace: true });
-      }, 3000);
-    } catch (error) {
-      console.error('Error submitting:', error);
-      toast.error("Failed to submit");
-      // Still cleanup even if submission fails
-      stopAllMediaStreams();
-      if (disconnectWebSocket) {
-        disconnectWebSocket();
-      }
-    }
-  };
-
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  if (!studentData) return null;
+  if (!studentData) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3">
+        <Loader2 className="w-10 h-10 animate-spin text-primary" />
+        <p className="text-sm text-muted-foreground">Preparing your exam workspace...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -773,8 +1027,19 @@ const StudentExam = () => {
               <CardContent className="p-6">
                 <h2 className="text-2xl font-bold mb-6">Examination Paper</h2>
                 
-                <div className="space-y-8">
-                  {questions.map((question, index) => (
+                {questionsLoading ? (
+                  <div className="flex flex-col items-center justify-center py-12">
+                    <Loader2 className="w-8 h-8 animate-spin text-primary mb-4" />
+                    <p className="text-sm text-muted-foreground">Loading exam questions...</p>
+                  </div>
+                ) : questions.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-12">
+                    <AlertTriangle className="w-8 h-8 text-muted-foreground mb-4" />
+                    <p className="text-sm text-muted-foreground">No questions available for this exam.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    {questions.map((question, index) => (
                     <div key={question.id} className="space-y-4 p-4 border rounded-lg">
                       <div className="flex items-start gap-2">
                         <span className="font-semibold text-primary">Q{question.question_number}.</span>
@@ -822,7 +1087,8 @@ const StudentExam = () => {
                       )}
                     </div>
                   ))}
-                </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
           </div>

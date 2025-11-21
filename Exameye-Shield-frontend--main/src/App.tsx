@@ -7,6 +7,7 @@ import Index from "./pages/Index";
 import StudentRegister from "./pages/StudentRegister";
 import StudentVerify from "./pages/StudentVerify";
 import StudentExam from "./pages/StudentExam";
+import CompatibilityCheck from "./pages/CompatibilityCheck";
 import AdminLogin from "./pages/AdminLogin";
 import AdminDashboard from "./pages/AdminDashboard";
 import AdminMonitor from "./pages/AdminMonitor";
@@ -14,6 +15,7 @@ import NotFound from "./pages/NotFound";
 import ExamTemplateUpload from "./pages/ExamTemplateUpload";
 import StudentReport from "./pages/StudentReport";
 import ExamAnalytics from "./pages/ExamAnalytics";
+import AdminSubjects from "./pages/AdminSubjects";
 
 const queryClient = new QueryClient();
 
@@ -27,9 +29,11 @@ const App = () => (
           <Route path="/" element={<Index />} />
           <Route path="/student/register" element={<StudentRegister />} />
         <Route path="/student/verify" element={<StudentVerify />} />
+        <Route path="/student/compatibility" element={<CompatibilityCheck />} />
         <Route path="/student/exam" element={<StudentExam />} />
         <Route path="/admin/login" element={<AdminLogin />} />
         <Route path="/admin/dashboard" element={<AdminDashboard />} />
+        <Route path="/admin/subjects" element={<AdminSubjects />} />
         <Route path="/admin/monitor" element={<AdminMonitor />} />
         <Route path="/admin/upload-template" element={<ExamTemplateUpload />} />
         <Route path="/admin/student-report" element={<StudentReport />} />

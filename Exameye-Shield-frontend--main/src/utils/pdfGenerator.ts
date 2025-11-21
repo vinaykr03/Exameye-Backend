@@ -19,7 +19,8 @@ export class PDFGenerator {
     subjectName?: string,
     subjectCode?: string,
     examScore?: { total_score: number; max_score: number; percentage: number; grade_letter: string },
-    faceImageUrl?: string
+    faceImageUrl?: string,
+    rollNo?: string
   ): Promise<string> {
     const pdf = new jsPDF();
     const pageWidth = pdf.internal.pageSize.getWidth();
@@ -84,11 +85,11 @@ export class PDFGenerator {
     pdf.setFontSize(11);
     pdf.setTextColor(60, 60, 60);
     
-    // Student ID
+    // Roll Number (preferred) or Student ID
     pdf.setFont('helvetica', 'bold');
-    pdf.text('Student ID:', 20, yPos);
+    pdf.text('Roll Number:', 20, yPos);
     pdf.setFont('helvetica', 'normal');
-    pdf.text(`${studentId || 'N/A'}`, 20 + pdf.getTextWidth('Student ID: ') + 2, yPos);
+    pdf.text(`${rollNo || studentId || 'N/A'}`, 20 + pdf.getTextWidth('Roll Number: ') + 2, yPos);
     yPos += 7;
     
     // Student Name

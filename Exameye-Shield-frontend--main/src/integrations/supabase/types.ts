@@ -14,6 +14,108 @@ export type Database = {
   }
   public: {
     Tables: {
+      compatibility_checks: {
+        Row: {
+          audio_baseline: number | null
+          browser_info: Json | null
+          created_at: string | null
+          exam_id: string | null
+          id: string
+          internet_speed_mbps: number | null
+          lighting_score: number | null
+          screen_resolution: string | null
+          screen_sharing_enabled: boolean | null
+          student_id: string | null
+          tab_token: string | null
+        }
+        Insert: {
+          audio_baseline?: number | null
+          browser_info?: Json | null
+          created_at?: string | null
+          exam_id?: string | null
+          id?: string
+          internet_speed_mbps?: number | null
+          lighting_score?: number | null
+          screen_resolution?: string | null
+          screen_sharing_enabled?: boolean | null
+          student_id?: string | null
+          tab_token?: string | null
+        }
+        Update: {
+          audio_baseline?: number | null
+          browser_info?: Json | null
+          created_at?: string | null
+          exam_id?: string | null
+          id?: string
+          internet_speed_mbps?: number | null
+          lighting_score?: number | null
+          screen_resolution?: string | null
+          screen_sharing_enabled?: boolean | null
+          student_id?: string | null
+          tab_token?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "compatibility_checks_exam_id_fkey"
+            columns: ["exam_id"]
+            isOneToOne: false
+            referencedRelation: "exams"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "compatibility_checks_student_id_fkey"
+            columns: ["student_id"]
+            isOneToOne: false
+            referencedRelation: "students"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      exam_active_sessions: {
+        Row: {
+          created_at: string | null
+          exam_id: string | null
+          id: string
+          is_active: boolean | null
+          last_heartbeat: string
+          session_token: string
+          student_id: string | null
+        }
+        Insert: {
+          created_at?: string | null
+          exam_id?: string | null
+          id?: string
+          is_active?: boolean | null
+          last_heartbeat?: string
+          session_token: string
+          student_id?: string | null
+        }
+        Update: {
+          created_at?: string | null
+          exam_id?: string | null
+          id?: string
+          is_active?: boolean | null
+          last_heartbeat?: string
+          session_token?: string
+          student_id?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "exam_active_sessions_exam_id_fkey"
+            columns: ["exam_id"]
+            isOneToOne: false
+            referencedRelation: "exams"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "exam_active_sessions_student_id_fkey"
+            columns: ["student_id"]
+            isOneToOne: false
+            referencedRelation: "students"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       exam_answers: {
         Row: {
           answer: string | null

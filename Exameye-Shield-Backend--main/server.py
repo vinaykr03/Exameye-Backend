@@ -6,6 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 from typing import Dict, List
 import base64
 import cv2
@@ -44,8 +45,35 @@ FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI
-app = FastAPI(title="AI Proctoring Service", version="1.0.0")
+# Lifespan context manager for startup and shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application startup and shutdown gracefully"""
+    # Startup
+    logger.info("🚀 Starting AI Proctoring Service...")
+    try:
+        # Any startup tasks can go here
+        logger.info("✅ AI Proctoring Service started successfully")
+        yield
+    except asyncio.CancelledError:
+        # Handle cancellation gracefully - this is normal during shutdown
+        logger.info("⚠️ Application shutdown requested")
+        # Don't re-raise CancelledError, just log it
+    except Exception as e:
+        logger.error(f"❌ Error during startup: {e}")
+        raise
+    finally:
+        # Shutdown
+        logger.info("🛑 Shutting down AI Proctoring Service...")
+        # Cleanup tasks can go here (close connections, etc.)
+        logger.info("✅ AI Proctoring Service shut down")
+
+# Initialize FastAPI with lifespan
+app = FastAPI(
+    title="AI Proctoring Service",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 # Serve Vite static assets (JS/CSS under /assets)
 if FRONTEND_DIST.exists():
@@ -92,20 +120,22 @@ active_connections: Dict[str, WebSocket] = {}
 def _upload_snapshot_and_get_url(
     supabase: Client,
     exam_id: str,
-    student_id: str,
+    roll_no: str,
     violation_type: str,
     snapshot_base64: str
 ):
     """
     Uploads a base64 JPEG snapshot to Supabase Storage bucket 'violation-evidence'
-    and returns a public URL. Returns None on failure.
+    Uses roll_no for file organization instead of student_id.
+    Returns a public URL. Returns None on failure.
     """
     try:
         if not snapshot_base64:
             return None
         image_data = base64.b64decode(snapshot_base64.split(',')[1] if ',' in snapshot_base64 else snapshot_base64)
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        filename = f"{exam_id}/{student_id}_{violation_type}_{timestamp}.jpg"
+        # Use roll_no for file organization: exam_id/roll_no_violation_type_timestamp.jpg
+        filename = f"{exam_id}/{roll_no}_{violation_type}_{timestamp}.jpg"
         # Upload
         supabase.storage.from_('violation-evidence').upload(
             filename,
@@ -143,15 +173,7 @@ async def health_check():
     }
 
 
-# Catch‑all route to serve React app (index.html) from Vite build
-@app.get("/{full_path:path}")
-async def serve_frontend(full_path: str):
-    index_file = FRONTEND_DIST / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file)
-    # Fallback JSON if frontend hasn't been built/deployed yet
-    return {"detail": "Frontend build not found", "path": full_path}
-
+# POST /api/grade-exam - must come BEFORE catch-all route
 @app.post("/api/grade-exam")
 async def grade_exam(request: dict):
     """
@@ -413,22 +435,23 @@ async def websocket_proctoring(websocket: WebSocket, session_id: str):
                         try:
                             exam_id = message.get('exam_id')
                             student_id = message.get('student_id')
+                            roll_no = message.get('roll_no') or message.get('rollNo') or "UNKNOWN"
                             student_name = message.get('student_name')
                             subject_code = message.get('subject_code', '')
                             subject_name = message.get('subject_name', '')
-                            logger.info(f"📋 Extracted from message: exam_id={exam_id}, student_id={student_id}, student_name='{student_name}', subject='{subject_name}' ({subject_code})")
+                            logger.info(f"📋 Extracted from message: exam_id={exam_id}, student_id={student_id}, roll_no={roll_no}, student_name='{student_name}', subject='{subject_name}' ({subject_code})")
                             snapshot_b64 = result.get('snapshot_base64')
                             # Track which violations were actually saved (not skipped due to cooldown)
                             saved_violations = []
                             # If there are violations, upload snapshot and insert rows
                             if result.get('violations'):
-                                logger.info(f"💾 Saving {len(result['violations'])} violations to database with student_name='{student_name}'...")
+                                logger.info(f"💾 Saving {len(result['violations'])} violations to database with student_name='{student_name}', roll_no='{roll_no}'...")
                                 image_url = None
                                 # Upload once and reuse URL for all violations in this frame
                                 if snapshot_b64:
                                     logger.info(f"📸 Uploading snapshot for violation...")
                                     image_url = _upload_snapshot_and_get_url(
-                                        supabase, exam_id or "unknown_exam", student_id or "unknown_student",
+                                        supabase, exam_id or "unknown_exam", roll_no or "UNKNOWN",
                                         result['violations'][0]['type'], snapshot_b64
                                     )
                                     logger.info(f"✅ Snapshot uploaded: {image_url}")
@@ -470,6 +493,7 @@ async def websocket_proctoring(websocket: WebSocket, session_id: str):
                                             "confidence": v.get("confidence"),
                                             "session_id": session_id,
                                             "student_name": student_name,
+                                            "roll_no": roll_no or "UNKNOWN",
                                             "student_id": student_id,
                                             "subject_code": subject_code,
                                             "subject_name": subject_name,
@@ -787,19 +811,19 @@ async def websocket_proctoring(websocket: WebSocket, session_id: str):
 @app.post("/api/upload-violation-snapshot")
 async def upload_violation_snapshot(
     exam_id: str,
-    student_id: str,
+    roll_no: str,
     student_name: str,
     violation_type: str,
     snapshot_base64: str
 ):
-    """Upload violation snapshot to Supabase Storage"""
+    """Upload violation snapshot to Supabase Storage using roll_no for file organization"""
     try:
         # Decode base64 image
         image_data = base64.b64decode(snapshot_base64.split(',')[1] if ',' in snapshot_base64 else snapshot_base64)
         
-        # Generate filename
+        # Generate filename using roll_no instead of student_id
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        filename = f"{exam_id}/{student_id}_{violation_type}_{timestamp}.jpg"
+        filename = f"{exam_id}/{roll_no}_{violation_type}_{timestamp}.jpg"
         
         # Upload to Supabase Storage
         response = supabase.storage.from_('violation-evidence').upload(
@@ -867,6 +891,85 @@ async def get_violations(exam_id: str = None, student_id: str = None):
     except Exception as e:
         logger.error(f"Error fetching violations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/students/{student_id}")
+async def get_student(student_id: str):
+    """Get a student by ID (UUID or student_id)"""
+    try:
+        logger.info(f"📍 Fetching student: {student_id}")
+        
+        # Try to find by UUID first
+        try:
+            result = supabase.table('students').select('*').eq('id', student_id).single().execute()
+            if result.data:
+                logger.info(f"✅ Found student by UUID: {result.data}")
+                return {
+                    "success": True,
+                    "data": result.data
+                }
+        except Exception as e:
+            logger.warning(f"⚠️ Student not found by UUID: {e}")
+        
+        # Try to find by student_id field
+        try:
+            result = supabase.table('students').select('*').eq('student_id', student_id).single().execute()
+            if result.data:
+                logger.info(f"✅ Found student by student_id: {result.data}")
+                return {
+                    "success": True,
+                    "data": result.data
+                }
+        except Exception as e:
+            logger.warning(f"⚠️ Student not found by student_id: {e}")
+        
+        # If not found by either method
+        logger.error(f"❌ Student not found: {student_id}")
+        raise HTTPException(status_code=404, detail=f"Student {student_id} not found")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching student: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/exams/{exam_id}")
+async def get_exam(exam_id: str):
+    """Get an exam by ID with related student and template data"""
+    try:
+        logger.info(f"📍 Fetching exam: {exam_id}")
+        
+        result = supabase.table('exams').select(
+            '*,' +
+            'students(id,name,email,student_id,face_image_url),' +
+            'exam_templates(id,subject_name,subject_code,duration_minutes)'
+        ).eq('id', exam_id).single().execute()
+        
+        if result.data:
+            logger.info(f"✅ Found exam: {result.data}")
+            return {
+                "success": True,
+                "data": result.data
+            }
+        else:
+            logger.error(f"❌ Exam not found: {exam_id}")
+            raise HTTPException(status_code=404, detail=f"Exam {exam_id} not found")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching exam: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Catch-all route to serve React app (index.html) from Vite build
+# MUST be at the very end after all other routes!
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    """Serve React frontend as fallback for all non-API routes"""
+    index_file = FRONTEND_DIST / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    # Fallback JSON if frontend hasn't been built/deployed yet
+    return {"detail": "Frontend build not found", "path": full_path}
 
 if __name__ == "__main__":
     import uvicorn

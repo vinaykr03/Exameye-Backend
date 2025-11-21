@@ -14,6 +14,7 @@ const StudentRegister = () => {
   const [formData, setFormData] = useState({
     name: "",
     email: "",
+    rollNo: "",
     subjectCode: "",
   });
   const [faceCapture, setFaceCapture] = useState(false);
@@ -178,12 +179,13 @@ const StudentRegister = () => {
     await startFaceCapture();
   };
 
-  const uploadFaceImage = async (studentId: string, studentName: string): Promise<string> => {
+  const uploadFaceImage = async (rollNo: string, studentName: string): Promise<string> => {
     try {
       const response = await fetch(faceImageUrl);
       const blob = await response.blob();
       
-      const fileName = `${studentId}/${studentName.replace(/\s+/g, '_')}_${Date.now()}.jpg`;
+      // Use roll_no for file organization instead of student_id
+      const fileName = `${rollNo}/${studentName.replace(/\s+/g, '_')}_${Date.now()}.jpg`;
       
       const { data, error } = await supabase.storage
         .from('face-registrations')
@@ -209,7 +211,7 @@ const StudentRegister = () => {
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (!formData.name.trim() || !formData.email.trim() || !formData.subjectCode.trim()) {
+    if (!formData.name.trim() || !formData.email.trim() || !formData.rollNo.trim() || !formData.subjectCode.trim()) {
       toast.error("Please fill in all fields");
       return;
     }
@@ -243,6 +245,7 @@ const StudentRegister = () => {
         .insert({
           name: formData.name.trim(),
           email: formData.email.trim(),
+          roll_no: formData.rollNo.trim().toUpperCase(),
           subject_code: subjectCode,
         })
         .select()
@@ -250,8 +253,8 @@ const StudentRegister = () => {
 
       if (studentError) throw studentError;
 
-      // Upload face image
-      const faceUrl = await uploadFaceImage(studentData.id, studentData.name);
+      // Upload face image (using roll_no for file organization)
+      const faceUrl = await uploadFaceImage(studentData.roll_no, studentData.name);
       
       // Update student with face image URL
       await supabase
@@ -279,6 +282,7 @@ const StudentRegister = () => {
       sessionStorage.setItem('studentData', JSON.stringify({
         id: studentData.id,
         name: studentData.name,
+        rollNo: studentData.roll_no,
         subjectCode: subjectCode,
         subjectName: templateData.subject_name,
       }));
@@ -348,6 +352,17 @@ const StudentRegister = () => {
                   placeholder="your.email@example.com"
                   value={formData.email}
                   onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="rollNo">Roll Number</Label>
+                <Input
+                  id="rollNo"
+                  placeholder="Enter your roll number (e.g., 2024CS001)"
+                  value={formData.rollNo}
+                  onChange={(e) => setFormData({ ...formData, rollNo: e.target.value.toUpperCase() })}
                   required
                 />
               </div>

@@ -14,24 +14,79 @@ interface ActiveExam {
   status: string;
   started_at: string;
   students: {
-    name: string;
-    email: string;
-    student_id: string;
-    face_image_url: string | null;
-  };
+    name?: string;
+    email?: string;
+    student_id?: string;
+    roll_no?: string;
+    face_image_url?: string | null;
+  } | null;
   exam_templates: {
     subject_name: string;
     subject_code: string;
   };
   violation_count?: number;
   last_activity?: string;
+  session_roll_no?: string;
+  session_student_id?: string;
 }
+
+type SessionRow = {
+  exam_id: string;
+  student_id: string;
+  last_heartbeat: string;
+  is_active: boolean;
+  roll_no?: string | null;
+};
+
+const HEARTBEAT_TIMEOUT_MS = 20000;
 
 const AdminMonitor = () => {
   const navigate = useNavigate();
   const [activeExams, setActiveExams] = useState<ActiveExam[]>([]);
   const [recentViolations, setRecentViolations] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const loadInProgressExamsFallback = async (): Promise<ActiveExam[]> => {
+    const { data: examsData, error: examsError } = await supabase
+      .from('exams')
+      .select(`
+        *,
+        students (
+          name,
+          email,
+          student_id,
+          roll_no,
+          face_image_url
+        ),
+        exam_templates (
+          subject_name,
+          subject_code
+        )
+      `)
+      .eq('status', 'in_progress')
+      .order('started_at', { ascending: false });
+
+    if (examsError) throw examsError;
+
+    const examsWithViolations = await Promise.all(
+      (examsData || []).map(async (exam) => {
+        const { count } = await supabase
+          .from('violations')
+          .select('*', { count: 'exact', head: true })
+          .eq('exam_id', exam.id);
+
+        return {
+          ...exam,
+          violation_count: count || 0,
+          last_activity: exam.started_at,
+          session_roll_no: exam.students?.roll_no,
+          session_student_id: exam.students?.student_id || exam.student_id,
+        };
+      })
+    );
+
+    return examsWithViolations;
+  };
 
   useEffect(() => {
     const isAuthenticated = sessionStorage.getItem('adminAuth');
@@ -51,6 +106,18 @@ const AdminMonitor = () => {
         { event: '*', schema: 'public', table: 'exams' },
         (payload) => {
           console.log('Exam update:', payload);
+          loadActiveExams();
+        }
+      )
+      .subscribe();
+
+    const sessionsChannel = supabase
+      .channel('exam-active-sessions-monitor')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'exam_active_sessions' },
+        (payload) => {
+          console.log('Active session update:', payload);
           loadActiveExams();
         }
       )
@@ -76,12 +143,41 @@ const AdminMonitor = () => {
     return () => {
       clearInterval(interval);
       supabase.removeChannel(examsChannel);
+      supabase.removeChannel(sessionsChannel);
       supabase.removeChannel(violationsChannel);
     };
   }, [navigate]);
 
   const loadActiveExams = async () => {
     try {
+      const heartbeatCutoff = new Date(Date.now() - HEARTBEAT_TIMEOUT_MS).toISOString();
+
+      const { data: sessionsData, error: sessionsError } = await supabase
+        .from('exam_active_sessions')
+        .select('exam_id, student_id, last_heartbeat, is_active, roll_no')
+        .eq('is_active', true)
+        .gt('last_heartbeat', heartbeatCutoff)
+        .order('last_heartbeat', { ascending: false });
+
+      if (sessionsError) throw sessionsError;
+
+      const sessions = (sessionsData || []) as SessionRow[];
+
+      if (sessions.length === 0) {
+        const fallbackExams = await loadInProgressExamsFallback();
+        setActiveExams(fallbackExams);
+        setLoading(false);
+        return;
+      }
+
+      const examIds = Array.from(new Set(sessions.map(session => session.exam_id).filter(Boolean)));
+      if (examIds.length === 0) {
+        const fallbackExams = await loadInProgressExamsFallback();
+        setActiveExams(fallbackExams);
+        setLoading(false);
+        return;
+      }
+
       const { data: examsData, error: examsError } = await supabase
         .from('exams')
         .select(`
@@ -90,6 +186,7 @@ const AdminMonitor = () => {
             name,
             email,
             student_id,
+            roll_no,
             face_image_url
           ),
           exam_templates (
@@ -97,33 +194,62 @@ const AdminMonitor = () => {
             subject_code
           )
         `)
-        .eq('status', 'in_progress')
+        .in('id', examIds)
         .order('started_at', { ascending: false });
 
       if (examsError) throw examsError;
 
-      // Get violation counts for each active exam
-      const examsWithViolations = await Promise.all(
-        (examsData || []).map(async (exam) => {
-          const { count } = await supabase
-            .from('violations')
-            .select('*', { count: 'exact', head: true })
-            .eq('exam_id', exam.id);
+      const { data: violationRows } = await supabase
+        .from('violations')
+        .select('exam_id')
+        .in('exam_id', examIds);
 
-          return {
+      const violationCounts = new Map<string, number>();
+      violationRows?.forEach(row => {
+        if (!row.exam_id) return;
+        violationCounts.set(row.exam_id, (violationCounts.get(row.exam_id) || 0) + 1);
+      });
+
+      const sessionsByExam = sessions.reduce<Map<string, SessionRow[]>>((map, session) => {
+        const list = map.get(session.exam_id) || [];
+        list.push(session);
+        map.set(session.exam_id, list);
+        return map;
+      }, new Map<string, SessionRow[]>());
+
+      const combined: ActiveExam[] = [];
+
+      (examsData || []).forEach(exam => {
+        const sessionsForExam = sessionsByExam.get(exam.id) || [];
+        sessionsForExam.forEach(session => {
+          combined.push({
             ...exam,
-            violation_count: count || 0,
-            last_activity: new Date().toISOString(),
-          };
-        })
-      );
+            violation_count: violationCounts.get(exam.id) || 0,
+            last_activity: session.last_heartbeat,
+            session_roll_no: session.roll_no || exam.students?.roll_no,
+            session_student_id: session.student_id,
+          });
+        });
+      });
 
-      setActiveExams(examsWithViolations);
+      if (combined.length === 0) {
+        const fallbackExams = await loadInProgressExamsFallback();
+        setActiveExams(fallbackExams);
+      } else {
+        setActiveExams(combined);
+      }
       setLoading(false);
     } catch (error) {
       console.error('Error loading active exams:', error);
-      toast.error("Failed to load active exams");
-      setLoading(false);
+      try {
+        const fallbackExams = await loadInProgressExamsFallback();
+        setActiveExams(fallbackExams);
+      } catch (fallbackError) {
+        console.error('Fallback load failed:', fallbackError);
+        toast.error("Failed to load active exams");
+      } finally {
+        setLoading(false);
+      }
     }
   };
 
@@ -260,11 +386,11 @@ const AdminMonitor = () => {
                     <CardContent className="p-4">
                       {/* Student Face Image */}
                       <div className="aspect-video bg-muted rounded-lg mb-4 overflow-hidden relative group">
-                        {exam.students.face_image_url ? (
+                        {exam.students?.face_image_url ? (
                           <>
                             <img 
-                              src={exam.students.face_image_url}
-                              alt={exam.students.name}
+                              src={exam.students?.face_image_url || ''}
+                              alt={exam.students?.name || 'Student'}
                               className="w-full h-full object-cover"
                               onError={(e) => {
                                 e.currentTarget.src = '/placeholder.svg';
@@ -287,16 +413,18 @@ const AdminMonitor = () => {
                       <div className="space-y-2">
                         <div className="flex items-start justify-between">
                           <div>
-                            <h3 className="font-bold text-lg">{exam.students.name}</h3>
-                            <p className="text-sm text-muted-foreground">{exam.students.student_id}</p>
+                            <h3 className="font-bold text-lg">{exam.students?.name || 'Unknown Student'}</h3>
+                            <p className="text-sm text-muted-foreground">
+                              Roll No: {exam.session_roll_no || exam.students?.roll_no || exam.students?.student_id || 'N/A'}
+                            </p>
                           </div>
                           <div className={`w-3 h-3 rounded-full ${getSeverityColor(exam.violation_count || 0)} animate-pulse`}></div>
                         </div>
 
                         <div className="text-xs text-muted-foreground">
-                          <p><span className="font-medium">Subject:</span> {exam.exam_templates?.subject_name}</p>
-                          <p><span className="font-medium">Code:</span> {exam.exam_templates?.subject_code}</p>
-                          <p><span className="font-medium">Started:</span> {formatTime(exam.started_at)}</p>
+                          <p><span className="font-medium">Subject:</span> {exam.exam_templates?.subject_name || exam.subject_code}</p>
+                          <p><span className="font-medium">Code:</span> {exam.exam_templates?.subject_code || exam.subject_code}</p>
+                          <p><span className="font-medium">Last heartbeat:</span> {exam.last_activity ? formatTime(exam.last_activity) : 'N/A'}</p>
                         </div>
 
                         <div className="flex items-center justify-between pt-2 border-t">
