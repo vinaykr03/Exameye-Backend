@@ -5,7 +5,7 @@
 [![GitHub issues](https://img.shields.io/github/issues/vinaykr8807/Automated-Exam-Proctoring-System)](https://github.com/vinaykr8807/Automated-Exam-Proctoring-System/issues)
 [![License](https://img.shields.io/github/license/vinaykr8807/Automated-Exam-Proctoring-System)](LICENSE)
 
-> **TEAM-IMMORTAL** | **Tech-Immortal**
+> **Immortal Cypher** | **Tech-Immortal**
 
 A comprehensive AI-powered exam proctoring system with real-time monitoring, automatic grading, and advanced violation detection using computer vision and machine learning.
 
@@ -83,6 +83,124 @@ npm run dev
 - Run migrations from `supabase/migrations/`
 - Configure RLS policies
 - Set up storage buckets for violation evidence
+
+</details>
+
+## 🛠️ Project Setup Guide
+
+<details>
+<summary>📋 Complete Setup Instructions</summary>
+
+### Prerequisites
+- **Node.js** 16+ and npm
+- **Python** 3.8+ with pip
+- **Git** for version control
+- **Supabase** account (free tier available)
+- **Webcam and microphone** for testing
+
+### Step 1: Clone and Navigate
+```bash
+git clone https://github.com/vinaykr8807/Automated-Exam-Proctoring-System.git
+cd Automated-Exam-Proctoring-System
+```
+
+### Step 2: Backend Setup (Python/FastAPI)
+```bash
+# Navigate to backend directory
+cd Exameye-Shield-Backend--main
+
+# Create and activate virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Download YOLOv8 model
+python download_model.py
+
+# Create environment file
+cp .env.example .env
+# Edit .env with your Supabase credentials:
+# SUPABASE_URL=your_supabase_project_url
+# SUPABASE_KEY=your_supabase_anon_key
+```
+
+### Step 3: Frontend Setup (React/TypeScript)
+```bash
+# Navigate to frontend directory (from project root)
+cd Exameye-Shield-frontend--main
+
+# Install Node.js dependencies
+npm install
+
+# Create environment file
+cp .env.example .env
+# Edit .env with:
+# VITE_SUPABASE_URL=your_supabase_project_url
+# VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
+# VITE_PROCTORING_API_URL=http://localhost:8001
+# VITE_PROCTORING_WS_URL=ws://localhost:8001
+```
+
+### Step 4: Supabase Database Setup
+1. **Create Supabase Project**:
+   - Go to [supabase.com](https://supabase.com)
+   - Create new project
+   - Note your project URL and anon key
+
+2. **Run Database Migrations**:
+   ```bash
+   # Install Supabase CLI
+   npm install -g supabase
+   
+   # Navigate to frontend directory
+   cd Exameye-Shield-frontend--main
+   
+   # Run migrations
+   supabase db push
+   ```
+
+3. **Set up Storage Buckets**:
+   - Create bucket named `violation-evidence`
+   - Enable public access for evidence images
+
+### Step 5: Running the Application
+
+**Terminal 1 - Backend Server:**
+```bash
+cd Exameye-Shield-Backend--main
+source venv/bin/activate  # or venv\Scripts\activate on Windows
+uvicorn server:app --reload --host 0.0.0.0 --port 8001
+```
+
+**Terminal 2 - Frontend Development Server:**
+```bash
+cd Exameye-Shield-frontend--main
+npm run dev
+```
+
+### Step 6: Access the Application
+- **Student Interface**: http://localhost:5173
+- **Admin Interface**: http://localhost:5173/admin.html
+- **API Documentation**: http://localhost:8001/docs
+- **Backend Health Check**: http://localhost:8001/health
+
+### Step 7: Testing the System
+1. **Compatibility Check**: Test camera and microphone
+2. **Student Registration**: Register with face verification
+3. **Exam Creation**: Upload exam templates via admin
+4. **Live Monitoring**: Start exam and monitor violations
+5. **Admin Dashboard**: View real-time analytics
+
+### Troubleshooting
+- **Camera Issues**: Ensure browser permissions are granted
+- **WebSocket Errors**: Check firewall and antivirus settings
+- **Database Errors**: Verify Supabase credentials and migrations
+- **Model Loading**: Ensure YOLOv8 model is downloaded correctly
 
 </details>
 
@@ -171,13 +289,13 @@ graph TB
 <table>
 <tr>
 <td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/python/python-original.svg" width="40" height="40"/><br><b>Python 3.8+</b></td>
-<td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/fastapi/fastapi-original.svg" width="40" height="40"/><br><b>FastAPI</b></td>
+<td align="center"><img src="https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png" width="40" height="40"/><br><b>FastAPI</b></td>
 <td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/opencv/opencv-original.svg" width="40" height="40"/><br><b>OpenCV</b></td>
-<td align="center"><img src="https://upload.wikimedia.org/wikipedia/commons/3/32/MediaPipe_Logo.png" width="40" height="40"/><br><b>MediaPipe</b></td>
+<td align="center"><img src="https://mediapipe.dev/images/mediapipe_small.png" width="40" height="40"/><br><b>MediaPipe</b></td>
 </tr>
 <tr>
-<td align="center"><img src="https://raw.githubusercontent.com/ultralytics/assets/main/logo/Ultralytics_Logotype_Original.svg" width="40" height="40"/><br><b>YOLOv8</b></td>
-<td align="center"><img src="https://supabase.com/brand-assets/supabase-logo-icon.png" width="40" height="40"/><br><b>Supabase</b></td>
+<td align="center"><img src="https://github.com/ultralytics/assets/raw/main/logo/Ultralytics_Logotype_Original.svg" width="40" height="40"/><br><b>YOLOv8</b></td>
+<td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/supabase/supabase-original.svg" width="40" height="40"/><br><b>Supabase</b></td>
 <td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/postgresql/postgresql-original.svg" width="40" height="40"/><br><b>PostgreSQL</b></td>
 <td align="center"><img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/docker/docker-original.svg" width="40" height="40"/><br><b>Docker</b></td>
 </tr>
@@ -469,7 +587,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 <div align="center">
 
-### **TEAM-IMMORTAL**
+### **Immortal Cypher**
 *Building the future of secure online examinations*
 
 **Tech-Immortal** - *Innovation that never dies* 🚀
